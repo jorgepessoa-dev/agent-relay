@@ -1,8 +1,8 @@
 # agent-relay — design
 
-**Status**: verificado pelo DeepCode (seq 155-157, 2026-08-17/18) — achados incorporados abaixo.
+**Status**: verificado pelo DeepCode em duas passagens (seq 155-158, 2026-08-17/18) — achados incorporados abaixo.
 **Origem**: extraído de `/opt/agent-relay` no droplet do trading-advisor (ver `governance/adr/ADR-192_multi_agent_autoevolution_architecture.md` no repo tradingadvisor para o contexto de arquitectura que o motivou).
-**Prior art confirmado** (pesquisa 2026-08-18): a convergência da comunidade em 2026 é exactamente file-based JSONL com file-locking para mailbox entre agentes em tmux (ex: AgentMail, agent-orchestrator issue #853) — o desenho base está alinhado com o estado da arte; não há motivo para reescrever para FIFO/stdin.
+**Nota sobre prior-art** [UNCONFIRMED]: uma pesquisa web (2026-08-18) sugeriu que file-based JSONL+locking é o padrão comum para mailbox entre agentes em tmux, citando "AgentMail" e "agent-orchestrator issue #853". O DeepCode verificou essas duas fontes por pesquisa independente e nenhuma corresponde ao que foi afirmado (AgentMail é mailbox estilo email, não JSONL+flock; o issue #853 citado não é o mesmo projecto). **Removida a alegação — não decide a arquitectura.** A escolha mailbox JSONL + tmux nudge mantém-se pelo mérito próprio: é o mecanismo já validado em produção no droplet, não por conformidade a um padrão de mercado não confirmado.
 
 ## Propósito
 
@@ -37,10 +37,12 @@ agents:
 
 - Um ficheiro JSONL por agente-destinatário: `<box_dir>/to_<nome>.jsonl`, append-only, **criado com permissões 0600** (achado DeepCode Q1 nota 4: mailbox 0666 permite qualquer processo no host forjar `from`; 0600 não resolve multi-host mas reduz a superfície local sem complexidade extra).
 - Um cursor por agente: `<box_dir>/.cursor_<nome>`, escrito por write-temp-then-rename (atómico; achado DeepCode Q1 nota 5b — `write_text` directo pode truncar a meio de um crash).
-- Append protegido por `fcntl.flock` exclusivo sobre o ficheiro JSONL durante todo o ciclo ler-contagem+escrever (achado DeepCode Q1 nota 1 — `seq` por contagem de linhas não é atómico entre sends concorrentes; sem lock, dois agentes a escrever ao mesmo destinatário podem gerar `seq` duplicado e o cursor salta uma mensagem).
-- Cada linha: `{seq, ts_utc, from, head, tokens, body}`. `head` = git HEAD curto do **repo do remetente**, recalculado no momento da leitura contra o `repo_path` desse agente (não comparado com o HEAD do leitor). Achado DeepCode Q1 nota 2: comparar com o HEAD do leitor produz falsos "SENDER HEAD DIFFERS" sempre que os agentes vivem em repos diferentes — a pergunta certa é "o mundo do remetente moveu-se desde que ele escreveu isto?", não "o meu repo é igual ao dele?".
+- Append protegido por `fcntl.flock` **exclusivo** sobre o ficheiro JSONL durante todo o ciclo ler-contagem+escrever (achado DeepCode Q1 nota 1). `read`/`peek` tomam `flock` **partilhado** (`LOCK_SH`) durante a leitura — achado DeepCode v2 nota 4: sem lock também do lado da leitura, um `read` concorrente com um `send` de corpo grande (o `send` plain, ao contrário do `safe-send`, não tem limite de tamanho) pode apanhar a última linha a meio da escrita e crashar em `json.loads`; com `LOCK_SH` a leitura espera pelo `flock` exclusivo do writer soltar antes de ler.
+- Cada linha: `{seq, ts_utc, from, head, tokens, body}`. `head` = git HEAD curto do remetente, **capturado no momento do `send`** e **comparado no `read`** contra o HEAD actual do `repo_path` desse mesmo agente (não contra o HEAD do leitor) — achado DeepCode Q1 nota 2 + clarificação v2: o campo guardado não é recomputado, é o HEAD-actual-do-remetente que é lido de novo no momento da leitura para a comparação.
 - **Read receipt: fora de âmbito do v1, declarado explicitamente** (achado DeepCode Q1 nota 3). O relay garante entrega (mensagem no ficheiro + nudge tentado), não confirmação de leitura. Quem precisar de ack faz `read` seguido de um `send` de confirmação — é composição, não uma feature nova do transporte.
-- **Trust model: same-host, agentes confiados.** Sem assinatura, sem verificação de `from`. Declarado, não escondido — se algum dia houver agentes multi-host, isto tem de ser revisto antes de os ligar (não é um "TODO" implícito).
+- **Idempotência de retry: fora de âmbito, declarado.** (achado DeepCode v2 nota 3) Reenviar uma mensagem após uma falha de nudge cria uma nova linha/`seq` — não há deduplicação. Um retry é, por definição, uma mensagem nova.
+- **`box_dir` relativo resolve contra a CWD do processo que corre o `relay.py`, não contra a localização do script** (achado DeepCode v2 nota 2). `send`/`read`/`peek`/`doctor` devem correr a partir da raiz do projecto onde vive o `relay.yaml`.
+- **Trust model: same-host, mesmo utilizador OS, agentes confiados.** Sem assinatura, sem verificação de `from`. Permissões 0600 no mailbox **assumem que todos os agentes correm como o mesmo user** (achado DeepCode v2 nota 5) — se um deployment precisar de agentes em users OS diferentes no mesmo host, usa grupo partilhado + 0660 em vez de 0600 (não é o default, é uma troca explícita que o operador faz). Declarado, não escondido — se algum dia houver agentes multi-host, isto tem de ser revisto antes de os ligar.
 
 ## Comandos
 
@@ -49,8 +51,10 @@ relay.py send      --from A --to B --body "..." [--tokens N]
 relay.py safe-send  --from A --to B --body "..."   # com guardas (ver abaixo)
 relay.py read       --as B                          # imprime não lidas, avança cursor
 relay.py peek        --as B                          # imprime não lidas, não avança
-relay.py beat        --as A --tokens N               # heartbeat
+relay.py doctor     --agent X                        # valida tmux_session/busy_regex/input_prefix contra a realidade
 ```
+
+`beat` (heartbeat) sai do v1 — achado DeepCode v2 nota 1: com N agentes, "o destinatário do heartbeat" deixa de ser implícito ("o outro"), e generalizar para `--from A --to B` transforma-o num `send` com um corpo convencionado (`[heartbeat] tokens=N`). Não há mecanismo novo aqui — quem quiser heartbeat compõe com `send --body "[heartbeat] tokens=$N"`.
 
 `send` sempre tenta o nudge (`tmux send-keys` para a sessão do destinatário) e verifica se o texto ficou preso na caixa de input em vez de assumir entrega.
 
@@ -84,3 +88,5 @@ Confirmado pelo DeepCode: atomicidade de `seq`, semântica de staleness e o fals
 - **Nudge para sessão tmux inexistente reporta "SESSÃO AUSENTE", nunca "delivered"** (regressão do bug ao vivo apanhado pelo DeepCode em seq=156).
 - Dois `send` concorrentes ao mesmo destinatário (via threads/subprocessos em paralelo) produzem `seq` estritamente ascendente e sem duplicados.
 - `relay.py doctor` detecta `tmux_session` inexistente e recusa avançar.
+- `read` concorrente com um `send` de corpo grande a meio da escrita não crasha (espera pelo `LOCK_SH`, não lê linha parcial).
+- `send`/`read` correndo de uma CWD diferente da raiz do projecto falham de forma legível (não silenciosamente contra o `box_dir` errado).
