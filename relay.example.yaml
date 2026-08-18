@@ -1,0 +1,14 @@
+box_dir: ./agent-relay-mail
+agents:
+  - name: coord
+    tmux_session: claude
+    busy_regex: 'esc to interrupt'
+    input_prefix: "> "
+    repo_path: /opt/my-project        # opcional — activa o head-check de staleness
+    placeholder: "Type your message"  # opcional — default já é este valor
+
+  - name: dc
+    tmux_session: deepcode_session
+    busy_regex: 'status: (processing|pending)'
+    input_prefix: "> "
+    repo_path: /opt/my-project
