@@ -45,6 +45,21 @@ cada projecto, não deste mecanismo de transporte. Sem read receipt (garante
 entrega, não leitura). Sem deduplicação de retries. Sem autenticação
 cross-host — assume mesmo utilizador OS, mesmo host, agentes confiados.
 
+## Usado por
+
+- [`seed-experimental-framework`](https://github.com/jorgepessoa-dev/seed-experimental-framework)
+  — coordena Claude Code, Codex e DeepCode em verificação ortogonal multi-vendor.
+- Um sistema de trading algorítmico privado (mesmo mecanismo, origem deste repo).
+
+## Vários projectos, uma máquina
+
+Cada projecto tem o seu próprio `relay.yaml`/`relay.json` com `box_dir` absoluto
+e nomes de agente prefixados por projecto (ex: `ta.coordinator`, `seed.deepcode`)
+— nunca partilhar mailbox nem sessão tmux entre projectos, mesmo que corram no
+mesmo host. Se precisares de comunicação entre projectos, cria um config de "hub"
+à parte, com apenas os coordinators de cada projecto registados — nunca ligar os
+agentes de trabalho directamente uns aos outros.
+
 ## Licença
 
 MIT.
