@@ -199,7 +199,7 @@ def tmux_capture_pane(session: str) -> tuple:
         return False, ""
 
 
-def nudge(session: str, seq: int, body: str) -> str:
+def nudge(to_agent: dict, seq: int, body: str) -> str:
     """Push a mailbox notification into the recipient's tmux pane.
 
     Never returns "delivered" unless the session was confirmed present and
@@ -208,11 +208,12 @@ def nudge(session: str, seq: int, body: str) -> str:
     look like an empty tail. That conflation caused a real false-positive
     (DeepCode caught it live during this module's own verification).
     """
+    session = to_agent["tmux_session"]
     if not tmux_has_session(session):
         return "session_absent"
 
     first = body[:180].replace("\n", " ").replace('"', "'")
-    msg = f"[MAIL seq={seq}] {first}... -> relay.py read --as <you>"
+    msg = f"[MAIL seq={seq}] {first}... -> relay.py read --as {to_agent['name']}"
     subprocess.run(["tmux", "send-keys", "-t", session, msg], timeout=10, check=False)
     time.sleep(1.5)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], timeout=10, check=False)
@@ -221,8 +222,14 @@ def nudge(session: str, seq: int, body: str) -> str:
     if not ok:
         return "capture_failed"
 
-    tail = "\n".join(pane.splitlines()[-12:])
-    if f"MAIL seq={seq}" in tail:
+    # Only the current input line matters for "stuck" — the mail marker text
+    # is expected to still be visible in scrollback right after a successful
+    # send, so checking the last N lines produced false positives (2/6 in the
+    # live test matrix). A stuck send leaves the marker sitting unsent in the
+    # input box itself, identified by the recipient's input_prefix.
+    box_lines = [l for l in pane.splitlines() if l.startswith(to_agent["input_prefix"])]
+    current_input = box_lines[-1] if box_lines else ""
+    if f"MAIL seq={seq}" in current_input:
         return "stuck"
     return "delivered"
 
@@ -322,7 +329,7 @@ def _cmd_send(config, args, guarded: bool) -> int:
     )
     print(f"SENT seq={seq} to={args.to}")
 
-    status = nudge(to_agent["tmux_session"], seq, args.body)
+    status = nudge(to_agent, seq, args.body)
     print(f"NUDGE {status}")
     return 0
 

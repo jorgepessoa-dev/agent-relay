@@ -205,11 +205,19 @@ def test_tmux_capture_pane_failure(monkeypatch):
         assert ok is False
 
 
+AGENT = {
+    "name": "dc",
+    "tmux_session": "dc",
+    "busy_regex": r"status: (processing|pending)|esc to interrupt",
+    "input_prefix": "> ",
+}
+
+
 def test_nudge_reports_session_absent_never_delivered(monkeypatch):
     # Regression test: this is the exact bug DeepCode caught live (seq=156) —
     # the original nudge printed "delivered" when the tmux session did not exist.
     with patch("relay.tmux_has_session", return_value=False):
-        status = relay.nudge("ghost-session", 1, "corpo")
+        status = relay.nudge(AGENT, 1, "corpo")
     assert status == "session_absent"
     assert status != "delivered"
 
@@ -218,7 +226,7 @@ def test_nudge_reports_capture_failed(monkeypatch):
     with patch("relay.tmux_has_session", return_value=True), \
          patch("subprocess.run", return_value=_run(returncode=0)), \
          patch("relay.tmux_capture_pane", return_value=(False, "")):
-        status = relay.nudge("sess", 1, "corpo")
+        status = relay.nudge(AGENT, 1, "corpo")
     assert status == "capture_failed"
 
 
@@ -226,7 +234,7 @@ def test_nudge_reports_delivered_when_input_box_clear(monkeypatch):
     with patch("relay.tmux_has_session", return_value=True), \
          patch("subprocess.run", return_value=_run(returncode=0)), \
          patch("relay.tmux_capture_pane", return_value=(True, "algum texto\n> \n")):
-        status = relay.nudge("sess", 1, "corpo")
+        status = relay.nudge(AGENT, 1, "corpo")
     assert status == "delivered"
 
 
@@ -234,16 +242,41 @@ def test_nudge_reports_stuck_when_mail_marker_still_in_box(monkeypatch):
     with patch("relay.tmux_has_session", return_value=True), \
          patch("subprocess.run", return_value=_run(returncode=0)), \
          patch("relay.tmux_capture_pane", return_value=(True, "> [MAIL seq=1] corpo...\n")):
-        status = relay.nudge("sess", 1, "corpo")
+        status = relay.nudge(AGENT, 1, "corpo")
     assert status == "stuck"
 
 
-AGENT = {
-    "name": "dc",
-    "tmux_session": "dc",
-    "busy_regex": r"status: (processing|pending)|esc to interrupt",
-    "input_prefix": "> ",
-}
+def test_nudge_does_not_report_stuck_for_marker_only_in_scrollback(monkeypatch):
+    # Regression test: checking the last N lines of the pane (instead of just
+    # the current input line) produced false positives in live testing —
+    # the mail marker is expected to still be visible in scrollback right
+    # after a successful send, that alone doesn't mean it's stuck in the box.
+    pane = "> [MAIL seq=1] corpo...\n" + "some reply text\n" * 5 + "> \n"
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("subprocess.run", return_value=_run(returncode=0)), \
+         patch("relay.tmux_capture_pane", return_value=(True, pane)):
+        status = relay.nudge(AGENT, 1, "corpo")
+    assert status == "delivered"
+
+
+def test_nudge_injects_real_recipient_name_not_placeholder(monkeypatch):
+    # Regression test: nudge() used to inject a literal "<you>" placeholder
+    # instead of the recipient's actual agent name, causing recipients to
+    # guess wrong (Codex tried "read --as root" before finding the real name).
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["tmux", "send-keys"] and cmd[-1].startswith("[MAIL"):
+            captured["msg"] = cmd[-1]
+        return _run(returncode=0)
+
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("subprocess.run", side_effect=fake_run), \
+         patch("relay.tmux_capture_pane", return_value=(True, "> \n")):
+        relay.nudge(AGENT, 1, "corpo")
+
+    assert "<you>" not in captured["msg"]
+    assert f"read --as {AGENT['name']}" in captured["msg"]
 
 
 def test_check_safe_to_send_refuses_when_session_absent(monkeypatch):
