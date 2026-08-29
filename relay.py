@@ -199,6 +199,17 @@ def tmux_capture_pane(session: str) -> tuple:
         return False, ""
 
 
+def _input_box_clear(pane: str, to_agent: dict, seq: int) -> bool:
+    # Only the current input line matters for "stuck" — the mail marker text
+    # is expected to still be visible in scrollback right after a successful
+    # send, so checking the last N lines produced false positives (2/6 in the
+    # live test matrix). A stuck send leaves the marker sitting unsent in the
+    # input box itself, identified by the recipient's input_prefix.
+    box_lines = [l for l in pane.splitlines() if l.startswith(to_agent["input_prefix"])]
+    current_input = box_lines[-1] if box_lines else ""
+    return f"MAIL seq={seq}" not in current_input
+
+
 def nudge(to_agent: dict, seq: int, body: str) -> str:
     """Push a mailbox notification into the recipient's tmux pane.
 
@@ -207,6 +218,20 @@ def nudge(to_agent: dict, seq: int, body: str) -> str:
     failed / session gone" with "message scrolled off screen", both of which
     look like an empty tail. That conflation caused a real false-positive
     (DeepCode caught it live during this module's own verification).
+
+    A stuck nudge is retried twice (+2s, +3s) before being reported as
+    genuinely stuck — the observed real cause (5 occurrences, 2026-08-29
+    session) was a half-typed prior message already sitting in the input
+    box, where a second Enter reliably clears it. Bounded, not silent: a
+    persistent failure still reports "stuck" exactly as before, it is
+    never swallowed.
+
+    A 0.3s settle delay follows every Enter before capturing — found live
+    while building the retry's own R-FIRE test: capturing immediately can
+    catch the pane before it redraws, reporting "stuck" for an Enter that
+    actually cleared a moment later. This race predates the retry (the
+    original single-Enter path had the same gap); fixed here since the
+    retry is what surfaced it.
     """
     session = to_agent["tmux_session"]
     if not tmux_has_session(session):
@@ -217,21 +242,25 @@ def nudge(to_agent: dict, seq: int, body: str) -> str:
     subprocess.run(["tmux", "send-keys", "-t", session, msg], timeout=10, check=False)
     time.sleep(1.5)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], timeout=10, check=False)
+    time.sleep(0.3)  # let the pane redraw before capturing -- see retry docstring
 
     ok, pane = tmux_capture_pane(session)
     if not ok:
         return "capture_failed"
+    if _input_box_clear(pane, to_agent, seq):
+        return "delivered"
 
-    # Only the current input line matters for "stuck" — the mail marker text
-    # is expected to still be visible in scrollback right after a successful
-    # send, so checking the last N lines produced false positives (2/6 in the
-    # live test matrix). A stuck send leaves the marker sitting unsent in the
-    # input box itself, identified by the recipient's input_prefix.
-    box_lines = [l for l in pane.splitlines() if l.startswith(to_agent["input_prefix"])]
-    current_input = box_lines[-1] if box_lines else ""
-    if f"MAIL seq={seq}" in current_input:
-        return "stuck"
-    return "delivered"
+    for delay in (2, 3):
+        time.sleep(delay)
+        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], timeout=10, check=False)
+        time.sleep(0.3)
+        ok, pane = tmux_capture_pane(session)
+        if not ok:
+            return "capture_failed"
+        if _input_box_clear(pane, to_agent, seq):
+            return "delivered"
+
+    return "stuck"
 
 
 def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BODY_LEN) -> None:

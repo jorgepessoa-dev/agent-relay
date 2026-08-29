@@ -259,6 +259,47 @@ def test_nudge_does_not_report_stuck_for_marker_only_in_scrollback(monkeypatch):
     assert status == "delivered"
 
 
+def test_nudge_retries_and_clears_on_second_enter(monkeypatch):
+    # Real cause observed live (5 occurrences, 2026-08-29 session): a
+    # half-typed prior message sitting in the input box; a second Enter
+    # reliably clears it. The retry must not sleep for real in the test.
+    monkeypatch.setattr("relay.time.sleep", lambda s: None)
+    stuck_pane = (True, "> [MAIL seq=1] corpo...\n")
+    clear_pane = (True, "> [MAIL seq=1] corpo...\n> \n")
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("subprocess.run", return_value=_run(returncode=0)), \
+         patch("relay.tmux_capture_pane", side_effect=[stuck_pane, clear_pane]):
+        status = relay.nudge(AGENT, 1, "corpo")
+    assert status == "delivered"
+
+
+def test_nudge_reports_stuck_only_after_exhausting_both_retries(monkeypatch):
+    # Bounded, not silent: a persistent failure must still surface as
+    # "stuck" — the retry must never mask a genuine, non-transient failure.
+    monkeypatch.setattr("relay.time.sleep", lambda s: None)
+    stuck_pane = (True, "> [MAIL seq=1] corpo...\n")
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("subprocess.run", return_value=_run(returncode=0)) as mock_run, \
+         patch("relay.tmux_capture_pane", return_value=stuck_pane) as mock_capture:
+        status = relay.nudge(AGENT, 1, "corpo")
+    assert status == "stuck"
+    # 1 initial Enter + 2 retries = 3 Enter keypresses total (plus the 1
+    # message-typing send-keys call = 4 subprocess.run calls).
+    enter_calls = [c for c in mock_run.call_args_list if c[0][0][-1] == "Enter"]
+    assert len(enter_calls) == 3
+    assert mock_capture.call_count == 3
+
+
+def test_nudge_capture_failed_during_retry_short_circuits(monkeypatch):
+    monkeypatch.setattr("relay.time.sleep", lambda s: None)
+    stuck_pane = (True, "> [MAIL seq=1] corpo...\n")
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("subprocess.run", return_value=_run(returncode=0)), \
+         patch("relay.tmux_capture_pane", side_effect=[stuck_pane, (False, "")]):
+        status = relay.nudge(AGENT, 1, "corpo")
+    assert status == "capture_failed"
+
+
 def test_nudge_injects_real_recipient_name_not_placeholder(monkeypatch):
     # Regression test: nudge() used to inject a literal "<you>" placeholder
     # instead of the recipient's actual agent name, causing recipients to
