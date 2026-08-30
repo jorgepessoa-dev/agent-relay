@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +23,10 @@ UTC = timezone.utc  # datetime.UTC needs 3.11+; keep 3.10 compatible
 REQUIRED_AGENT_FIELDS = ("tmux_session", "busy_regex", "input_prefix")
 DEFAULT_PLACEHOLDER = "Type your message"
 DEFAULT_MAX_BODY_LEN = 1600
+DEFAULT_REDELIVERY_AFTER_S = 15 * 60
+REDELIVERY_BASE_BACKOFF_S = 30 * 60
+REDELIVERY_MAX_ATTEMPTS = 6
+REDELIVERY_MAX_PER_SWEEP = 2
 
 
 class RelayConfigError(Exception):
@@ -147,10 +152,92 @@ def read_cursor(box_dir: Path, name: str) -> int:
 
 
 def write_cursor_atomic(box_dir: Path, name: str, seq: int) -> None:
-    path = cursor_path(box_dir, name)
+    with _agent_delivery_lock(box_dir, name):
+        path = cursor_path(box_dir, name)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w") as fh:
+            fh.write(str(seq))
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        # Cursor advancement is the sole acknowledgement.  Clear the retry
+        # journal while holding the same per-agent lock as the advancement, so
+        # a sweep cannot lease a message that was already acknowledged.
+        with _redelivery_state_lock(box_dir):
+            state = _read_redelivery_state(box_dir)
+            if _clear_redelivery_through_state(state, name, seq):
+                _write_redelivery_state_atomic(box_dir, state)
+
+
+def redelivery_state_path(box_dir: Path) -> Path:
+    return box_dir / ".redelivery_state.json"
+
+
+@contextmanager
+def _agent_delivery_lock(box_dir: Path, name: str):
+    """Serialize a cursor decision with a recipient's acknowledgement."""
+    box_dir.mkdir(parents=True, exist_ok=True)
+    with (box_dir / f".delivery_{name}.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _redelivery_state_lock(box_dir: Path):
+    """Serialize sweep state updates across watchdog invocations."""
+    box_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = box_dir / ".redelivery_state.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _read_redelivery_state(box_dir: Path) -> dict:
+    path = redelivery_state_path(box_dir)
+    if not path.exists():
+        return {"version": 1, "entries": {}}
+    try:
+        value = json.loads(path.read_text())
+        entries = value.get("entries")
+        if isinstance(entries, dict):
+            return {"version": 1, "entries": entries}
+    except (OSError, ValueError, TypeError):
+        pass
+    # Do not turn an unread message into a false acknowledgement because the
+    # best-effort retry journal was damaged. Start a fresh, bounded schedule.
+    return {"version": 1, "entries": {}}
+
+
+def _write_redelivery_state_atomic(box_dir: Path, state: dict) -> None:
+    path = redelivery_state_path(box_dir)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(str(seq))
+    with tmp.open("w") as fh:
+        fh.write(json.dumps(state, sort_keys=True))
+        fh.flush()
+        os.fsync(fh.fileno())
     tmp.replace(path)
+
+
+def _entry_key(name: str, seq: int) -> str:
+    return f"{name}:{seq}"
+
+
+def _clear_redelivery_through_state(state: dict, name: str, seq: int) -> bool:
+    """Remove acknowledged retry entries; caller holds the state lock."""
+    entries = state["entries"]
+    removed = False
+    for key in list(entries):
+        agent, separator, raw_seq = key.rpartition(":")
+        if agent == name and separator and raw_seq.isdigit() and int(raw_seq) <= seq:
+            del entries[key]
+            removed = True
+    return removed
 
 
 def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
@@ -165,7 +252,17 @@ def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
-    records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    records = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            if isinstance(record, dict) and isinstance(record.get("seq"), int):
+                records.append(record)
+        except json.JSONDecodeError:
+            # A torn/corrupt line must not suppress delivery of later valid mail.
+            continue
     seen = read_cursor(box_dir, name)
     unread = [r for r in records if r["seq"] > seen]
 
@@ -173,6 +270,111 @@ def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
         write_cursor_atomic(box_dir, name, unread[-1]["seq"])
 
     return unread
+
+
+def _record_age_s(record: dict, now: datetime) -> float | None:
+    try:
+        timestamp = datetime.fromisoformat(record["ts_utc"])
+        if timestamp.tzinfo is None:
+            return None
+        return max(0.0, (now - timestamp).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _state_number(value: object, default: float = 0) -> float:
+    """Treat a damaged retry journal as an empty schedule, never a crash."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def redeliver_unread(
+    config: dict,
+    *,
+    now: datetime | None = None,
+    min_age_s: int = DEFAULT_REDELIVERY_AFTER_S,
+    base_backoff_s: int = REDELIVERY_BASE_BACKOFF_S,
+    max_attempts: int = REDELIVERY_MAX_ATTEMPTS,
+    max_renudges: int = REDELIVERY_MAX_PER_SWEEP,
+) -> list[tuple[str, int, str]]:
+    """Re-nudge old unread mail with persistent, bounded exponential backoff.
+
+    A recipient's cursor is the sole acknowledgement. Pane capture only says a
+    nudge was submitted, never that the agent consumed the message.
+    """
+    box_dir = resolve_box_dir(config)
+    now = now or datetime.now(UTC)
+    results = []
+    renudges_issued = 0
+    for agent in config.get("agents", []):
+        name = agent["name"]
+        # This lock defines the precise safety guarantee: mail unread when the
+        # decision is made is eligible. It is deliberately released before the
+        # potentially seven-second tmux operation, so acknowledgement is never
+        # blocked by a slow pane.
+        with _agent_delivery_lock(box_dir, name):
+            unread = read_messages(box_dir, name, advance=False)
+            if not unread:
+                continue
+            oldest = unread[0]  # oldest by mailbox sequence, never timestamp
+            key = _entry_key(name, oldest["seq"])
+            age_s = _record_age_s(oldest, now)
+            # A legacy/torn timestamp does not get to permanently block the
+            # sequence-ordered queue.  It is eligible now, while malformed
+            # JSON lines are ignored by read_messages().
+            if age_s is None:
+                age_s = min_age_s
+            if age_s < min_age_s:
+                results.append((name, oldest["seq"], "pending_age"))
+                continue
+            with _redelivery_state_lock(box_dir):
+                state = _read_redelivery_state(box_dir)
+                entries = state["entries"]
+                prior = entries.get(key, {})
+                attempts = int(_state_number(prior.get("attempts"), 0))
+                if attempts >= max_attempts:
+                    if not prior.get("escalated_at"):
+                        prior["escalated_at"] = now.isoformat()
+                        prior["last_status"] = "failed_cap"
+                        _write_redelivery_state_atomic(box_dir, state)
+                    results.append((name, oldest["seq"], "failed_cap"))
+                    continue
+                if now.timestamp() < _state_number(prior.get("next_due_at"), 0):
+                    results.append((name, oldest["seq"], "pending_backoff"))
+                    continue
+                if renudges_issued >= max_renudges:
+                    results.append((name, oldest["seq"], "sweep_cap"))
+                    continue
+                attempts += 1  # lease the attempt before releasing locks
+                entries[key] = {
+                    "attempts": attempts, "last_nudged_at": now.isoformat(),
+                    "last_status": "issuing",
+                    "next_due_at": now.timestamp() + base_backoff_s * (2 ** (attempts - 1)),
+                }
+                _write_redelivery_state_atomic(box_dir, state)
+                renudges_issued += 1
+        try:
+            check_safe_to_send(agent, oldest["body"])
+            status = nudge(agent, oldest["seq"], oldest["body"])
+        except RelaySendRefused:
+            status = "unsafe_busy_or_input"
+        except (OSError, subprocess.TimeoutExpired):
+            # A tmux timeout must be retried, not kill the sweep.
+            status = "nudge_error"
+        # Record the outcome unless the cursor has already acknowledged it.
+        with _redelivery_state_lock(box_dir):
+            if read_cursor(box_dir, name) < oldest["seq"]:
+                state = _read_redelivery_state(box_dir)
+                entry = state["entries"].get(key)
+                if entry:
+                    entry["last_status"] = status
+                    if status == "session_absent":
+                        entry["next_due_at"] = now.timestamp() + base_backoff_s * 4
+                    _write_redelivery_state_atomic(box_dir, state)
+        results.append((name, oldest["seq"], f"renudged_{status}"))
+    return results
 
 
 def tmux_has_session(session: str) -> bool:
@@ -329,6 +531,14 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--to", required=True)
         s.add_argument("--body", required=True)
         s.add_argument("--tokens", type=int, default=None)
+        s.add_argument(
+            "--require-delivery", action="store_true",
+            help="return nonzero unless the tmux nudge is confirmed delivered",
+        )
+        s.add_argument(
+            "--delivery-json", action="store_true",
+            help="emit a machine-readable notification-delivery result",
+        )
 
     for name in ("read", "peek"):
         r = sub.add_parser(name)
@@ -336,6 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor")
     d.add_argument("--agent", required=True)
+    redeliver = sub.add_parser("redeliver")
+    redeliver.add_argument("--due", action="store_true",
+                           help="compatibility marker: only due mail is swept")
 
     return p
 
@@ -360,12 +573,23 @@ def _cmd_send(config, args, guarded: bool) -> int:
 
     status = nudge(to_agent, seq, args.body)
     print(f"NUDGE {status}")
+    if args.delivery_json:
+        print("DELIVERY_RESULT " + json.dumps({
+            "seq": seq,
+            "nudge_status": status,
+            "delivered": status == "delivered",
+        }, sort_keys=True))
+    # The mailbox append is durable regardless of nudge outcome, but callers
+    # that need notification confirmation (liveness escalation) must not
+    # mistake a successful process exit for delivery.
+    if args.require_delivery and status != "delivered":
+        return 2
     return 0
 
 
 def _cmd_read(config, args, advance: bool) -> int:
     box_dir = resolve_box_dir(config)
-    agent = get_agent(config, args.who)
+    get_agent(config, args.who)  # validate recipient configuration
     unread = read_messages(box_dir, args.who, advance=advance)
     if not unread:
         print(f"(sem mensagens novas para {args.who})")
@@ -398,6 +622,17 @@ def _cmd_doctor(config, args) -> int:
     return 0
 
 
+def _cmd_redeliver(config) -> int:
+    escalated = False
+    for name, seq, status in redeliver_unread(config):
+        print(f"RENUDGE to={name} seq={seq} {status}")
+        escalated = escalated or status == "failed_cap"
+    if escalated:
+        print("ESCALATE: redelivery retry cap reached", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -419,6 +654,8 @@ def main(argv=None) -> int:
             return _cmd_read(config, args, advance=False)
         if args.cmd == "doctor":
             return _cmd_doctor(config, args)
+        if args.cmd == "redeliver":
+            return _cmd_redeliver(config)
     except RelayConfigError as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
         return 1

@@ -1,7 +1,7 @@
 import json
-import os
 import stat
 import threading
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,6 +61,123 @@ def test_resolve_box_dir_default(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     box = relay.resolve_box_dir({})
     assert box == (tmp_path / "agent-relay-mail").resolve()
+
+
+def test_redeliver_nudges_only_oldest_unread_after_age_threshold(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    relay.append_message(tmp_path, "a", "x", "two")
+    monkeypatch.setattr(relay, "nudge", lambda agent, seq, body: "delivered")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert relay.redeliver_unread(cfg, now=now) == [("a", 1, "renudged_delivered")]
+
+
+def test_redeliver_persists_backoff_and_cursor_clears_it(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    calls = []
+    monkeypatch.setattr(relay, "nudge", lambda agent, seq, body: calls.append(seq) or "delivered")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert relay.redeliver_unread(cfg, now=now, base_backoff_s=60) == [("a", 1, "renudged_delivered")]
+    assert relay.redeliver_unread(cfg, now=now + timedelta(seconds=30), base_backoff_s=60) == [("a", 1, "pending_backoff")]
+    relay.read_messages(tmp_path, "a", advance=True)
+    assert json.loads(relay.redelivery_state_path(tmp_path).read_text())["entries"] == {}
+    assert calls == [1]
+
+
+def test_redeliver_never_types_into_busy_agent_and_pauses_absent_session(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: (_ for _ in ()).throw(relay.RelaySendRefused()))
+    monkeypatch.setattr(relay, "nudge", lambda *args: (_ for _ in ()).throw(AssertionError("must not type")))
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert relay.redeliver_unread(cfg, now=now) == [("a", 1, "renudged_unsafe_busy_or_input")]
+
+
+def test_redeliver_skips_malformed_line_and_delivers_valid_mail(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    with relay.mailbox_path(tmp_path, "a").open("a") as fh:
+        fh.write("not json\n")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    monkeypatch.setattr(relay, "nudge", lambda *args: "delivered")
+    assert relay.redeliver_unread(cfg, now=datetime.now(timezone.utc) + timedelta(hours=1)) == [("a", 1, "renudged_delivered")]
+
+
+def test_redeliver_missing_timestamp_falls_back_to_sequence_order(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    record = json.loads(relay.mailbox_path(tmp_path, "a").read_text())
+    del record["ts_utc"]
+    relay.mailbox_path(tmp_path, "a").write_text(json.dumps(record) + "\n")
+    relay.append_message(tmp_path, "a", "x", "two")
+    sent = []
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    monkeypatch.setattr(relay, "nudge", lambda agent, seq, body: sent.append(seq) or "delivered")
+    assert relay.redeliver_unread(cfg, now=datetime.now(timezone.utc)) == [("a", 1, "renudged_delivered")]
+    assert sent == [1]
+
+
+def test_redeliver_caps_sweep_and_marks_hard_cap_for_escalation(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": name, "tmux_session": name, "busy_regex": "B", "input_prefix": "> "}
+        for name in ("a", "b", "c")
+    ]}
+    for name in ("a", "b", "c"):
+        relay.append_message(tmp_path, name, "x", "one")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    monkeypatch.setattr(relay, "nudge", lambda *args: "delivered")
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
+    results = relay.redeliver_unread(cfg, now=now, max_renudges=2)
+    assert results == [("a", 1, "renudged_delivered"), ("b", 1, "renudged_delivered"), ("c", 1, "sweep_cap")]
+
+    state = {"version": 1, "entries": {"a:1": {"attempts": 6, "next_due_at": 0}}}
+    relay._write_redelivery_state_atomic(tmp_path, state)
+    assert relay.redeliver_unread(cfg, now=now, max_renudges=0)[0] == ("a", 1, "failed_cap")
+    entry = json.loads(relay.redelivery_state_path(tmp_path).read_text())["entries"]["a:1"]
+    assert entry["last_status"] == "failed_cap"
+    assert "escalated_at" in entry
+
+
+def test_redeliver_session_absent_uses_longer_pause(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    relay.append_message(tmp_path, "a", "x", "one")
+    monkeypatch.setattr(relay, "check_safe_to_send", lambda agent, body: None)
+    monkeypatch.setattr(relay, "nudge", lambda *args: "session_absent")
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert relay.redeliver_unread(cfg, now=now, base_backoff_s=60) == [("a", 1, "renudged_session_absent")]
+    entry = json.loads(relay.redelivery_state_path(tmp_path).read_text())["entries"]["a:1"]
+    assert entry["next_due_at"] == now.timestamp() + 240
+
+
+def test_cli_redeliver_returns_nonzero_on_retry_cap(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path / "mail"), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
+    ]}
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    relay.append_message(relay.resolve_box_dir(cfg), "a", "x", "one")
+    record = json.loads(relay.mailbox_path(relay.resolve_box_dir(cfg), "a").read_text())
+    record["ts_utc"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    relay.mailbox_path(relay.resolve_box_dir(cfg), "a").write_text(json.dumps(record) + "\n")
+    relay._write_redelivery_state_atomic(relay.resolve_box_dir(cfg), {
+        "version": 1, "entries": {"a:1": {"attempts": relay.REDELIVERY_MAX_ATTEMPTS}},
+    })
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["redeliver", "--due"]) == 2
 
 
 def test_head_of_none_repo_path():
@@ -409,6 +526,46 @@ def test_cli_send_then_read_roundtrip(tmp_path, monkeypatch):
     assert len(unread) == 1
     assert unread[0]["body"] == "oi"
     assert unread[0]["from"] == "a"
+
+
+def test_cli_send_require_delivery_fails_but_keeps_durable_mailbox(tmp_path, monkeypatch):
+    cfg = {
+        "box_dir": "./mail",
+        "agents": [
+            {"name": "a", "tmux_session": "sess-a", "busy_regex": "X", "input_prefix": "> "},
+            {"name": "b", "tmux_session": "sess-b", "busy_regex": "X", "input_prefix": "> "},
+        ],
+    }
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    with patch("relay.tmux_has_session", return_value=False):
+        assert relay.main([
+            "send", "--from", "a", "--to", "b", "--body", "oi", "--require-delivery",
+        ]) == 2
+    unread = relay.read_messages(relay.resolve_box_dir(cfg), "b", advance=False)
+    assert [record["body"] for record in unread] == ["oi"]
+
+
+def test_cli_delivery_json_surfaces_non_delivery(tmp_path, monkeypatch, capsys):
+    cfg = {
+        "box_dir": "./mail",
+        "agents": [
+            {"name": "a", "tmux_session": "sess-a", "busy_regex": "X", "input_prefix": "> "},
+            {"name": "b", "tmux_session": "sess-b", "busy_regex": "X", "input_prefix": "> "},
+        ],
+    }
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    monkeypatch.chdir(tmp_path)
+    with patch("relay.tmux_has_session", return_value=False):
+        assert relay.main([
+            "send", "--from", "a", "--to", "b", "--body", "oi", "--delivery-json",
+        ]) == 0
+    line = next(line for line in capsys.readouterr().out.splitlines()
+                if line.startswith("DELIVERY_RESULT "))
+    assert json.loads(line.removeprefix("DELIVERY_RESULT ")) == {
+        "delivered": False, "nudge_status": "session_absent", "seq": 1,
+    }
 
 
 def test_cli_safe_send_refuses_and_returns_nonzero(tmp_path, monkeypatch):
