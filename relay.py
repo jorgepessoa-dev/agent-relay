@@ -24,6 +24,10 @@ REQUIRED_AGENT_FIELDS = ("tmux_session", "busy_regex", "input_prefix")
 DEFAULT_PLACEHOLDER = "Type your message"
 DEFAULT_MAX_BODY_LEN = 1600
 DEFAULT_REDELIVERY_AFTER_S = 15 * 60
+APPROVAL_DIALOG_MARKERS = (
+    "Would you like to run the following command?",
+    "Press enter to confirm or esc to cancel",
+)
 REDELIVERY_BASE_BACKOFF_S = 30 * 60
 REDELIVERY_MAX_ATTEMPTS = 6
 REDELIVERY_MAX_PER_SWEEP = 2
@@ -438,6 +442,11 @@ def nudge(to_agent: dict, seq: int, body: str) -> str:
     session = to_agent["tmux_session"]
     if not tmux_has_session(session):
         return "session_absent"
+    ok, pane = tmux_capture_pane(session)
+    if not ok:
+        return "capture_failed"
+    if any(marker in pane for marker in APPROVAL_DIALOG_MARKERS):
+        return "awaiting_approval"
 
     first = body[:180].replace("\n", " ").replace('"', "'")
     msg = f"[MAIL seq={seq}] {first}... -> relay.py read --as {to_agent['name']}"
@@ -486,6 +495,8 @@ def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BO
             )
 
     recent = "\n".join(lines[-14:])
+    if any(marker in pane for marker in APPROVAL_DIALOG_MARKERS):
+        raise RelaySendRefused(f"'{session}' está a aguardar aprovação")
     if re.search(agent_cfg["busy_regex"], recent):
         raise RelaySendRefused(f"'{session}' está a meio de turno")
 

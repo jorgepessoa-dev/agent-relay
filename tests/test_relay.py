@@ -347,6 +347,19 @@ def test_nudge_reports_capture_failed(monkeypatch):
     assert status == "capture_failed"
 
 
+def test_nudge_defers_without_typing_when_approval_dialog_visible(monkeypatch):
+    monkeypatch.setattr(relay, "tmux_has_session", lambda session: True)
+    monkeypatch.setattr(
+        relay, "tmux_capture_pane",
+        lambda session: (True, "Would you like to run the following command?\nPress enter to confirm or esc to cancel"),
+    )
+    monkeypatch.setattr(
+        relay.subprocess, "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not type into approval dialog")),
+    )
+    assert relay.nudge(AGENT, 1, "corpo") == "awaiting_approval"
+
+
 def test_nudge_reports_delivered_when_input_box_clear(monkeypatch):
     with patch("relay.tmux_has_session", return_value=True), \
          patch("subprocess.run", return_value=_run(returncode=0)), \
@@ -404,7 +417,8 @@ def test_nudge_reports_stuck_only_after_exhausting_both_retries(monkeypatch):
     # message-typing send-keys call = 4 subprocess.run calls).
     enter_calls = [c for c in mock_run.call_args_list if c[0][0][-1] == "Enter"]
     assert len(enter_calls) == 3
-    assert mock_capture.call_count == 3
+    # One pre-send safety capture plus one after each Enter.
+    assert mock_capture.call_count == 4
 
 
 def test_nudge_capture_failed_during_retry_short_circuits(monkeypatch):
