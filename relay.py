@@ -507,6 +507,49 @@ def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BO
         )
 
 
+DEFAULT_QUOTA_MARKERS = (
+    "402", "insufficient balance", "quota exceeded", "out of quota",
+    "billing", "balance", "rate limit", "context limit", "payment required",
+)
+STATUS_SESSION_ABSENT = "session_absent"
+STATUS_BUSY = "busy"
+STATUS_IDLE = "idle"
+STATUS_QUOTA = "quota_exhausted"
+STATUS_APPROVAL = "blocked_on_approval"
+STATUS_STUCK = "stuck_mid_turn"
+_UNHEALTHY_PRESENT = (STATUS_QUOTA, STATUS_APPROVAL, STATUS_STUCK)
+
+
+def _classify_doctor(agent_cfg: dict, signals: dict) -> dict:
+    """Add a named failure-mode classification to the raw doctor signals.
+
+    Distinguishes the three externally-indistinguishable failure modes:
+    session absent / quota exhausted / input stuck. ``pane_tail`` is lowercased
+    for marker scanning; per-agent ``quota_markers`` may extend the defaults.
+    """
+    session_ok = signals["session_ok"]
+    pane = signals.get("pane_tail", "")
+    if not session_ok:
+        return {**signals, "status": STATUS_SESSION_ABSENT}
+
+    lower = pane.lower()
+    quota_markers = tuple(agent_cfg.get("quota_markers") or ()) + DEFAULT_QUOTA_MARKERS
+    quota_hit = any(m in lower for m in quota_markers)
+    approval_hit = any(m.lower() in lower for m in APPROVAL_DIALOG_MARKERS)
+
+    if signals["busy_regex_matched"]:
+        status = STATUS_BUSY
+    elif quota_hit:
+        status = STATUS_QUOTA
+    elif approval_hit:
+        status = STATUS_APPROVAL
+    elif signals["input_prefix_found"]:
+        status = STATUS_IDLE
+    else:
+        status = STATUS_STUCK
+    return {**signals, "status": status}
+
+
 def doctor_check(agent_cfg: dict) -> dict:
     session = agent_cfg["tmux_session"]
     if not tmux_has_session(session):
@@ -515,13 +558,14 @@ def doctor_check(agent_cfg: dict) -> dict:
             "pane_tail": "",
             "busy_regex_matched": False,
             "input_prefix_found": False,
+            "status": STATUS_SESSION_ABSENT,
         }
 
     ok, pane = tmux_capture_pane(session)
     if not ok:
         pane = ""
 
-    return {
+    signals = {
         "session_ok": True,
         "pane_tail": pane,
         "busy_regex_matched": bool(re.search(agent_cfg["busy_regex"], pane)),
@@ -529,6 +573,7 @@ def doctor_check(agent_cfg: dict) -> dict:
             l.startswith(agent_cfg["input_prefix"]) for l in pane.splitlines()
         ),
     }
+    return _classify_doctor(agent_cfg, signals)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -623,9 +668,16 @@ def _cmd_doctor(config, args) -> int:
     agent = get_agent(config, args.agent)
     result = doctor_check(agent)
     print(f"session_ok={result['session_ok']}")
+    print(f"status={result['status']}")
     if not result["session_ok"]:
         print(f"ERRO: sessão tmux '{agent['tmux_session']}' não existe", file=sys.stderr)
         return 1
+    if result["status"] in _UNHEALTHY_PRESENT:
+        print(
+            f"ERRO: agente '{args.agent}' em modo de falha '{result['status']}'",
+            file=sys.stderr,
+        )
+        return 2
     print(f"busy_regex_matched={result['busy_regex_matched']} (normal variar consoante o estado actual)")
     print(f"input_prefix_found={result['input_prefix_found']}")
     print("--- pane tail ---")
