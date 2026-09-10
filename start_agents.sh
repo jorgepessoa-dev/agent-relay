@@ -41,4 +41,25 @@ if [ "${START_COORDINATOR:-0}" = "1" ]; then
   start_session claude bash -lc "cd /opt/tradingadvisor && claude --remote-control coordinator"
 fi
 
+# --- governance handshake (owner 2026-09-10: any agent that comes up is
+# GOVERNED automatically, or the boot FAILS LOUD). The ack is issued by the
+# BOOTSTRAP, so it is recorded with acked_by=bootstrap and only means "this
+# session was started with the governance pointer and hash in place" — never
+# "the agent read it".
+PIN_DIR="/root"
+POINTERS="/root/.claude/CLAUDE.md /root/.codex/AGENTS.md /root/.deepcode/AGENTS.md"
+for ptr in $POINTERS; do
+  if [ ! -s "$ptr" ]; then
+    echo "GOVERNANCE FAIL: pointer missing or empty: $ptr (session will be UNGOVERNED)"
+    return 1 2>/dev/null || exit 1
+  fi
+done
+for agent in coordinator deepcode codex gemini; do
+  if [ -x /opt/tradingadvisor/.venv/bin/python ]; then
+    /opt/tradingadvisor/.venv/bin/python /opt/tradingadvisor/scripts/ops/gov_ack.py \
+      ack --agent "$agent" --by bootstrap || true
+  fi
+done
+echo "governance handshake: pointers present, acks issued (acked_by=bootstrap)"
+
 echo "start_agents done"
