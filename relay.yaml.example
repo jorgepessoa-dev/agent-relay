@@ -1,4 +1,5 @@
-# agent-relay configuration TEMPLATE (versioned).
+# RECOVERY COPY of THIS droplet's live relay.yaml (versioned).
+# Distinct from relay.example.yaml, which is a generic template for new deployments.
 #
 # The LIVE file is 'relay.yaml' (gitignored, machine-local). Recover with:
 #   cp relay.yaml.example relay.yaml

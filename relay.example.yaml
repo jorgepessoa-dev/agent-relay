@@ -1,3 +1,6 @@
+# GENERIC template for a NEW deployment of agent-relay (placeholder names:
+# coord/dc). For RECOVERING this droplet's real relay.yaml, use
+# relay.yaml.example (exact copy of the live config).
 box_dir: ./agent-relay-mail
 agents:
   - name: coord
