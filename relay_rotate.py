@@ -36,14 +36,31 @@ def _log(msg: str, log_path: Path) -> None:
 
 
 def rotate_one(mailbox: Path, archive_dir: Path, keep: int, *,
+               max_bytes: int | None = None,
                now: datetime | None = None, dry_run: bool = False) -> dict:
-    """Keep the last `keep` messages, archive the rest. Returns a record."""
+    """Keep the last `keep` messages (and fit `max_bytes`), archive the rest.
+
+    Rotation triggers on EITHER threshold: line count > keep OR file size >
+    max_bytes. A mailbox with few but huge messages (e.g. 323 lines / 1.1 MB)
+    must rotate too — a line-only threshold silently skips it.
+    """
     now = now or datetime.now(UTC)
     lines = [ln for ln in mailbox.read_text().splitlines() if ln.strip()]
-    if len(lines) <= keep:
+    size = mailbox.stat().st_size
+    over_lines = len(lines) > keep
+    over_bytes = max_bytes is not None and size > max_bytes
+    if not (over_lines or over_bytes):
         return {"mailbox": mailbox.name, "total": len(lines), "archived": 0,
-                "kept": len(lines), "skipped": True}
+                "kept": len(lines), "skipped": True,
+                "bytes_before": size, "bytes_after": size,
+                "trigger": None}
     old, kept = lines[: len(lines) - keep], lines[len(lines) - keep:]
+    # byte budget: drop oldest kept messages until the live file fits
+    if max_bytes is not None:
+        def _size(seq_lines):
+            return sum(len(ln.encode()) + 1 for ln in seq_lines)
+        while kept and _size(kept) > max_bytes and len(kept) > 1:
+            old.append(kept.pop(0))
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     arch = archive_dir / f"{mailbox.stem}.{stamp}.jsonl.gz"
     rec = {
@@ -51,6 +68,9 @@ def rotate_one(mailbox: Path, archive_dir: Path, keep: int, *,
         "total": len(lines),
         "archived": len(old),
         "kept": len(kept),
+        "bytes_before": size,
+        "bytes_after": sum(len(ln.encode()) + 1 for ln in kept),
+        "trigger": "lines" if over_lines else "bytes",
         "archive": str(arch),
         "rotated_at": now.isoformat(),
         "first_archived_seq": json.loads(old[0]).get("seq") if old else None,
@@ -78,6 +98,8 @@ def main() -> int:
     ap.add_argument("--box", default=str(BOX_DEFAULT))
     ap.add_argument("--keep", type=int, default=500,
                     help="messages to keep live per mailbox")
+    ap.add_argument("--max-bytes", type=int, default=1_000_000,
+                    help="rotate when a mailbox exceeds this size (bytes)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     box = Path(args.box)
@@ -94,6 +116,7 @@ def main() -> int:
             results = []
             for mailbox in sorted(box.glob("to_*.jsonl")):
                 rec = rotate_one(mailbox, archive_dir, args.keep,
+                                 max_bytes=args.max_bytes,
                                  dry_run=args.dry_run)
                 results.append(rec)
                 _log(json.dumps(rec, ensure_ascii=False), log_path)
