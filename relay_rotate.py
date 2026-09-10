@@ -211,6 +211,39 @@ def rotate_one(mailbox: Path, archive_dir: Path, keep: int, *,
     return rec
 
 
+def orphan_scan(box: Path, archive_dir: Path | None = None) -> dict:
+    """Genuine orphans only, with the MANIFEST as the source of truth.
+
+    A detector that greps only the live disk reports archived payloads as
+    orphans, and acting on that destroys evidence (2026-09-10: a first count
+    said 7 orphans; the truth was 1 — the other 6 were referenced by archived
+    messages). References therefore come from:
+      (a) the append-only MANIFEST (payloads archived with their messages), and
+      (b) the LIVE mailboxes.
+    """
+    archive_dir = archive_dir or (box / "archive")
+    referenced: set[str] = set()
+    manifest = archive_dir / "MANIFEST.jsonl"
+    if manifest.exists():
+        for line in manifest.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("orig"):
+                referenced.add(rec["orig"])
+            for p in rec.get("payloads", []):
+                referenced.add(p["orig"])
+    for mb in sorted(box.glob("to_*.jsonl")):
+        for line in mb.read_text().splitlines():
+            if line.strip():
+                for ref in raw_payload_refs(line, box=box):
+                    referenced.add(str(ref))
+    files = sorted(p for p in box.glob("*.md"))
+    orphans = [str(p) for p in files if str(p) not in referenced]
+    return {"notes": len(files), "referenced": len(referenced),
+            "orphans": orphans, "source_of_truth": "MANIFEST.jsonl + live mailboxes"}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--box", default=str(BOX_DEFAULT))
@@ -221,6 +254,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--repair", action="store_true",
                     help="archive payloads referenced by already-archived messages")
+    ap.add_argument("--orphans", action="store_true",
+                    help="list GENUINE orphan notes (source: MANIFEST + live mailboxes)")
     ap.add_argument("--restore", metavar="MAILBOX",
                     help="reconstruct a message from the archive (use with --seq)")
     ap.add_argument("--seq", type=int, default=None)
@@ -232,6 +267,9 @@ def main() -> int:
     import fcntl
 
     archive_dir.mkdir(parents=True, exist_ok=True)
+    if args.orphans:
+        print(json.dumps(orphan_scan(box), indent=2, ensure_ascii=False))
+        return 0
     if args.repair:
         fixed = repair_archive(box, archive_dir)
         for f in fixed:
