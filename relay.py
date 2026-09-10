@@ -520,6 +520,7 @@ DEFAULT_QUOTA_MARKERS = (
 STATUS_SESSION_ABSENT = "session_absent"
 STATUS_BUSY = "busy"
 STATUS_IDLE = "idle"
+STATUS_SCRIPT = "script_running"
 STATUS_QUOTA = "quota_exhausted"
 STATUS_APPROVAL = "blocked_on_approval"
 STATUS_STUCK = "stuck_mid_turn"
@@ -543,12 +544,20 @@ def _classify_doctor(agent_cfg: dict, signals: dict) -> dict:
     quota_hit = any(m in lower for m in quota_markers)
     approval_hit = any(m.lower() in lower for m in APPROVAL_DIALOG_MARKERS)
 
-    if signals["busy_regex_matched"]:
-        status = STATUS_BUSY
-    elif quota_hit:
+    # Script agents (no TUI: busy_regex NEVER_MATCHES and no placeholder) never
+    # show a prompt — without this they are misclassified as stuck_mid_turn.
+    is_script = (
+        agent_cfg.get("busy_regex") == "NEVER_MATCHES"
+        and not agent_cfg.get("placeholder")
+    )
+    if quota_hit:
         status = STATUS_QUOTA
     elif approval_hit:
         status = STATUS_APPROVAL
+    elif is_script:
+        status = STATUS_SCRIPT
+    elif signals["busy_regex_matched"]:
+        status = STATUS_BUSY
     elif signals["input_prefix_found"]:
         status = STATUS_IDLE
     else:
