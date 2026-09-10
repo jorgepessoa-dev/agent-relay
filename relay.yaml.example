@@ -1,0 +1,36 @@
+# agent-relay configuration TEMPLATE (versioned).
+#
+# The LIVE file is 'relay.yaml' (gitignored, machine-local). Recover with:
+#   cp relay.yaml.example relay.yaml
+# A missing relay.yaml makes relay.py fail ('relay.yaml nao encontrado').
+# Keep this template in sync whenever the live file changes structurally.
+
+box_dir: /opt/agent-relay/mail
+agents:
+- name: coordinator
+  tmux_session: claude
+  busy_regex: esc to interrupt
+  input_prefix: ❯ 
+  placeholder: Try "
+  repo_path: /opt/tradingadvisor
+- name: deepcode
+  tmux_session: deepcode
+  busy_regex: 'status: (processing|pending)'
+  input_prefix: '> '
+  repo_path: /opt/tradingadvisor
+- name: codex
+  tmux_session: codex
+  busy_regex: esc to interrupt
+  input_prefix: '› '
+  placeholder: Ask Codex to do anything
+  repo_path: /opt/tradingadvisor
+- name: gemini
+  tmux_session: gemini
+  busy_regex: NEVER_MATCHES
+  input_prefix: '> '
+  repo_path: /opt/tradingadvisor
+- name: scheduler
+  tmux_session: null
+  busy_regex: NEVER_MATCHES
+  input_prefix: ''
+  repo_path: /opt/tradingadvisor
