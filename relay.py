@@ -106,6 +106,11 @@ def mailbox_path(box_dir: Path, name: str) -> Path:
     return box_dir / f"to_{name}.jsonl"
 
 
+def seq_path(box_dir: Path, name: str) -> Path:
+    """Durable monotonic seq counter for a mailbox (survives rotation)."""
+    return box_dir / f".seq_{name}"
+
+
 def append_message(
     box_dir: Path,
     to_name: str,
@@ -122,8 +127,22 @@ def append_message(
         fh = os.fdopen(fd, "r+")
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
-            fh.seek(0)
-            seq = sum(1 for _ in fh) + 1
+            # Seq comes from a DURABLE counter, not the line count: after a
+            # mailbox rotation the live file is shorter, and counting lines
+            # would re-issue already-used seqs (cursor corruption). The
+            # counter file is written under the same exclusive lock; a legacy
+            # mailbox without one is initialised from its current line count
+            # (backwards compatible).
+            counter = seq_path(box_dir, to_name)
+            if counter.exists():
+                try:
+                    seq = int(counter.read_text().strip() or 0) + 1
+                except ValueError:
+                    seq = sum(1 for _ in fh) + 1
+            else:
+                fh.seek(0)
+                seq = sum(1 for _ in fh) + 1
+            counter.write_text(str(seq))
             record = {
                 "seq": seq,
                 "ts_utc": datetime.now(UTC).isoformat(timespec="seconds"),
