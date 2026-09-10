@@ -508,8 +508,14 @@ def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BO
 
 
 DEFAULT_QUOTA_MARKERS = (
-    "402", "insufficient balance", "quota exceeded", "out of quota",
-    "billing", "balance", "rate limit", "context limit", "payment required",
+    # generic
+    "402", "insufficient balance", "out of quota", "payment required",
+    # codex/OpenAI real wording (2026-09-09 pane): the healthy line
+    # "You have N usage limit resets available" must NOT match, so these
+    # are anchored to the blocked phrasing only.
+    "hit your usage limit", "try again at", "upgrade to plus",
+    # generic rate/context limits
+    "quota exceeded", "rate limit", "context limit",
 )
 STATUS_SESSION_ABSENT = "session_absent"
 STATUS_BUSY = "busy"
