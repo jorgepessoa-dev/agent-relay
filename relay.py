@@ -633,6 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("read", "peek"):
         r = sub.add_parser(name)
         r.add_argument("--as", dest="who", required=True)
+        r.add_argument("--json", action="store_true",
+                       help="emit raw JSONL records instead of formatted text")
 
     d = sub.add_parser("doctor")
     d.add_argument("--agent", required=True)
@@ -683,6 +685,10 @@ def _cmd_read(config, args, advance: bool) -> int:
     unread = read_messages(box_dir, args.who, advance=advance)
     if not unread:
         print(f"(sem mensagens novas para {args.who})")
+        return 0
+    if getattr(args, "json", False):
+        for rec in unread:
+            print(json.dumps(rec, ensure_ascii=False))
         return 0
     for rec in unread:
         stale = ""
