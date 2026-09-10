@@ -8,6 +8,7 @@ race conditions) this fixes.
 """
 import argparse
 import fcntl
+import gzip
 import json
 import os
 import re
@@ -111,6 +112,40 @@ def seq_path(box_dir: Path, name: str) -> Path:
     return box_dir / f".seq_{name}"
 
 
+def high_seq(box_dir: Path, name: str) -> int:
+    """Highest seq ever issued in a mailbox: live records AND archived (.gz).
+
+    Counting lines is what corrupted codex's counter (2026-09-10): after rotation
+    the live file is shorter than the history, so a line count is below the real
+    high-water mark and new messages are born behind the cursor.
+    """
+    high = 0
+    live = box_dir / f"to_{name}.jsonl"
+    if live.exists():
+        for line in live.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                high = max(high, int(json.loads(line).get("seq", 0)))
+            except (ValueError, json.JSONDecodeError):
+                continue
+    for gz in sorted(box_dir.glob(f"*to_{name}*.gz")) + sorted(box_dir.glob(f"archive/*to_{name}*.gz")):
+        if not gz.exists():
+            continue
+        try:
+            with gzip.open(gz, "rt", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        high = max(high, int(json.loads(line).get("seq", 0)))
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+        except OSError:
+            continue
+    return high
+
+
 def append_message(
     box_dir: Path,
     to_name: str,
@@ -129,19 +164,21 @@ def append_message(
         try:
             # Seq comes from a DURABLE counter, not the line count: after a
             # mailbox rotation the live file is shorter, and counting lines
-            # would re-issue already-used seqs (cursor corruption). The
-            # counter file is written under the same exclusive lock; a legacy
-            # mailbox without one is initialised from its current line count
-            # (backwards compatible).
+            # re-issues already-used seqs (cursor corruption). MEASURED BUG
+            # 2026-09-10: the legacy fallback seeded the counter from the LINE
+            # COUNT, so codex's box got .seq=503 while its real max(seq) was 649 —
+            # every new message was born BELOW the cursor (647) and never seen.
+            # The seed is now the real high-water mark over LIVE + ARCHIVED
+            # (.gz) records, never a count of lines.
             counter = seq_path(box_dir, to_name)
+            seq = None
             if counter.exists():
                 try:
                     seq = int(counter.read_text().strip() or 0) + 1
                 except ValueError:
-                    seq = sum(1 for _ in fh) + 1
-            else:
-                fh.seek(0)
-                seq = sum(1 for _ in fh) + 1
+                    seq = None
+            if seq is None or seq <= high_seq(box_dir, to_name):
+                seq = high_seq(box_dir, to_name) + 1
             counter.write_text(str(seq))
             record = {
                 "seq": seq,
