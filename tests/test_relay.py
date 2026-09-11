@@ -749,8 +749,15 @@ def test_an_unknown_role_without_tmux_is_refused_not_labelled_api(tmp_path, monk
     assert relay.main(["send", "--from", "a", "--to", "ghost", "--body", "job"]) == 1
     captured = capsys.readouterr()          # captured ONCE: a second read is empty
     combined = captured.out + captured.err
+    # The VETO (seq1829) proved this test was passing for the wrong reason: it only
+    # checked that 'api_consumer' did not appear, while the invalid recipient was
+    # still APPENDED to and reported SENT. The oracle is that nothing is delivered
+    # to at all.
+    assert "SENT" not in captured.out, "an invalid recipient must not be accepted"
     assert "api_consumer" not in combined
     assert "unknown" in combined.lower()
+    assert not (tmp_path / "mail" / "to_ghost.jsonl").exists(), (
+        "a mailbox must not be created for a recipient the rule refuses")
 
 
 def test_the_query_answers_structurally_for_a_valid_api_agent(tmp_path, monkeypatch, capsys):

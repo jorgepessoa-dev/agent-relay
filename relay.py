@@ -718,6 +718,21 @@ def _cmd_send(config, args, guarded: bool) -> int:
         print("REFUSED: empty or whitespace-only body: nothing to send", file=sys.stderr)
         return 1
 
+    # F-977 VETO remediation: an INVALID recipient must not be delivered to at all -
+    # no mailbox, no seq, no SENT. This runs BEFORE the append, unlike `none`, whose
+    # refusal is a POLICY for a KNOWN role and stays after it so the sender's mistake
+    # is recorded (F-979). The cases differ: `none` is declared and refused by design;
+    # `unknown` is a configuration error, and creating a mailbox for it would BE the
+    # delivery the rule forbids. Preserving evidence does not authorise the append.
+    role = consumer_role(to_agent)
+    if role == "unknown":
+        print(f"REFUSED: {args.to!r} declares mail_consumer="
+              f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so no "
+              f"the role is unknown and no consumer can be established; "
+              f"nothing was written (F-977)",
+              file=sys.stderr)
+        return 1
+
     if guarded:
         try:
             check_safe_to_send(to_agent, args.body)
@@ -731,15 +746,8 @@ def _cmd_send(config, args, guarded: bool) -> int:
     )
     print(f"SENT seq={seq} to={args.to}")
 
-    role = consumer_role(to_agent)
     if role == "none":
         print("NUDGE no_consumer", file=sys.stderr)
-        return 1
-    if role == "unknown":
-        print(f"NUDGE unknown_consumer: {args.to!r} declares mail_consumer="
-              f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so no "
-              f"consumer can be established; refusing delivery (F-977)",
-              file=sys.stderr)
         return 1
     if role == "api":
         print("NUDGE api_consumer")
