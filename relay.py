@@ -29,6 +29,12 @@ APPROVAL_DIALOG_MARKERS = (
     "Would you like to run the following command?",
     "Press enter to confirm or esc to cancel",
 )
+# A current approval dialog may display a multi-line command between its
+# opening marker and the prompt; the real capture for F-980 had ten such
+# lines after the opening marker but lost the footer.  Four lines is enough
+# for quota text, but falsely reports that dialog as idle.  This remains a
+# bounded current-interaction window, not a scan of quoted scrollback.
+APPROVAL_SCAN_TAIL_LINES = 12
 REDELIVERY_BASE_BACKOFF_S = 30 * 60
 REDELIVERY_MAX_ATTEMPTS = 6
 REDELIVERY_MAX_PER_SWEEP = 2
@@ -606,9 +612,10 @@ def _classify_doctor(agent_cfg: dict, signals: dict) -> dict:
     # can establish an approval/quota block (agent_liveness uses the same rule).
     lines = [line for line in pane.splitlines() if line.strip()]
     lower = "\n".join(lines[-4:]).lower()
+    approval_tail = "\n".join(lines[-APPROVAL_SCAN_TAIL_LINES:]).lower()
     quota_markers = tuple(agent_cfg.get("quota_markers") or ()) + DEFAULT_QUOTA_MARKERS
     quota_hit = any(m in lower for m in quota_markers)
-    approval_hit = any(m.lower() in lower for m in APPROVAL_DIALOG_MARKERS)
+    approval_hit = any(m.lower() in approval_tail for m in APPROVAL_DIALOG_MARKERS)
 
     # Script agents (no TUI: busy_regex NEVER_MATCHES and no placeholder) never
     # show a prompt — without this they are misclassified as stuck_mid_turn.

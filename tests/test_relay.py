@@ -540,6 +540,40 @@ def test_doctor_check_no_input_prefix_found():
     assert result["input_prefix_found"] is False
 
 
+def test_doctor_marks_approval_when_only_start_marker_survives_near_tail():
+    """F-980: a real dialog without its footer must not look idle/healthy."""
+    pane = (
+        "Would you like to run the following command?\n"
+        "python3 relay.py send --body long-payload\n"
+        "argument 1\n"
+        "argument 2\n"
+        "argument 3\n"
+        "argument 4\n"
+        "argument 5\n"
+        "argument 6\n"
+        "argument 7\n"
+        "argument 8\n"
+        "> Type your message...\n"
+    )
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("relay.tmux_capture_pane", return_value=(True, pane)):
+        result = relay.doctor_check(AGENT)
+    assert result["status"] == relay.STATUS_APPROVAL
+
+
+def test_doctor_ignores_approval_marker_outside_interaction_window():
+    """A quoted old dialog must not make an otherwise idle pane look blocked."""
+    pane = (
+        "mail quote: Would you like to run the following command?\n"
+        + "old scrollback\n" * 12
+        + "> Type your message...\n"
+    )
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("relay.tmux_capture_pane", return_value=(True, pane)):
+        result = relay.doctor_check(AGENT)
+    assert result["status"] == relay.STATUS_IDLE
+
+
 def test_cli_send_then_read_roundtrip(tmp_path, monkeypatch):
     cfg = {
         "box_dir": "./mail",
