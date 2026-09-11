@@ -384,10 +384,10 @@ def redeliver_unread(
         name = agent["name"]
         # Scheduler is a sender/cron role, not a mailbox consumer.  Retrying a
         # message to it can only burn the bounded retry budget forever.
-        if agent.get("mail_consumer") == "none":
-            continue
-        if not agent.get("tmux_session"):
-            # API consumers poll their durable mailbox; they need no tmux nudge.
+        role = consumer_role(agent)
+        if role in ("none", "api", "unknown"):
+            # none: sender/cron only. api: durable mailbox, no nudge needed.
+            # unknown: no consumer can be established; send already refuses it.
             continue
         # This lock defines the precise safety guarantee: mail unread when the
         # decision is made is eligible. It is deliberately released before the
@@ -696,6 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
         r.add_argument("--json", action="store_true",
                        help="emit raw JSONL records instead of formatted text")
 
+    check = sub.add_parser("check-consumer", help="THE consumer role rule")
+    check.add_argument("agent")
     d = sub.add_parser("doctor")
     d.add_argument("--agent", required=True)
     redeliver = sub.add_parser("redeliver")
@@ -729,10 +731,17 @@ def _cmd_send(config, args, guarded: bool) -> int:
     )
     print(f"SENT seq={seq} to={args.to}")
 
-    if to_agent.get("mail_consumer") == "none":
+    role = consumer_role(to_agent)
+    if role == "none":
         print("NUDGE no_consumer", file=sys.stderr)
         return 1
-    if not to_agent.get("tmux_session"):
+    if role == "unknown":
+        print(f"NUDGE unknown_consumer: {args.to!r} declares mail_consumer="
+              f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so no "
+              f"consumer can be established; refusing delivery (F-977)",
+              file=sys.stderr)
+        return 1
+    if role == "api":
         print("NUDGE api_consumer")
         return 0
 
@@ -809,6 +818,60 @@ def _cmd_redeliver(config) -> int:
     return 0
 
 
+#: The recognised consumer roles. ANYTHING else is `unknown` and is refused, because
+#: "no tmux" used to mean "api" and that let a mailbox nobody can poll look like a
+#: working channel (F-977).
+CONSUMER_ROLES = ("tmux", "api", "none")
+
+
+def consumer_role(agent: dict) -> str:
+    """THE ONE consumer-configuration rule (F-977).
+
+    `tmux` gets nudges; `api` is a durable mailbox that is polled and needs no
+    nudge; `none` is a sender/cron role whose delivery is refused. A recipient with
+    no pane and no recognised role is `unknown`, and both delivery and polling must
+    refuse it BEFORE treating it as a consumer. Callers must not re-implement this:
+    the bridge asks for it through the `check-consumer` query instead, because a
+    duplicated rule is exactly how these two callers came to disagree.
+    """
+    role = str(agent.get("mail_consumer") or "").strip()
+    if role in CONSUMER_ROLES:
+        return role
+    if agent.get("tmux_session"):
+        return "tmux"
+    return "unknown"
+
+
+def check_consumer(config: dict, name: str) -> dict:
+    """Structured answer for the CLI query: role, validity, and why."""
+    agent = next((a for a in config.get("agents", []) if a.get("name") == name), None)
+    if agent is None:
+        return {"agent": name, "role": "unknown", "valid": False,
+                "reason": "no such agent in the relay configuration"}
+    role = consumer_role(agent)
+    valid = role in ("tmux", "api")
+    reason = {
+        "tmux": "interactive pane: nudged, delivery allowed",
+        "api": "durable mailbox: polled by the agent, no nudge, delivery allowed",
+        "none": "sender/cron only: delivery is refused by design",
+        "unknown": ("no tmux_session and mail_consumer is not one of "
+                    + "/".join(CONSUMER_ROLES) + ": no consumer can be established"),
+    }[role]
+    return {"agent": name, "role": role, "valid": valid, "reason": reason,
+            "mail_consumer": agent.get("mail_consumer")}
+
+
+def _cmd_check_consumer(config: dict, args) -> int:
+    """The query the bridge invokes by subprocess instead of keeping its own rule."""
+    answer = check_consumer(config, args.agent)
+    print(json.dumps(answer, ensure_ascii=False))
+    if answer["valid"]:
+        return 0
+    print(f"REFUSED: {args.agent!r} is not a valid consumer: {answer['reason']}",
+          file=sys.stderr)
+    return 1
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -830,6 +893,8 @@ def main(argv=None) -> int:
             return _cmd_read(config, args, advance=False)
         if args.cmd == "doctor":
             return _cmd_doctor(config, args)
+        if args.cmd == "check-consumer":
+            return _cmd_check_consumer(config, args)
         if args.cmd == "redeliver":
             return _cmd_redeliver(config)
     except RelayConfigError as exc:

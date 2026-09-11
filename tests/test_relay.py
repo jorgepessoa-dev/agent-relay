@@ -720,3 +720,66 @@ def test_cli_missing_config_fails_legibly(tmp_path, monkeypatch, capsys):
     assert code == 1
     err = capsys.readouterr().err
     assert "relay.yaml" in err or "relay.json" in err
+
+
+# ── F-977: ONE consumer-configuration rule, and the unknown role is REFUSED ──
+
+def _cfg_with(tmp_path, agent_entry):
+    cfg = {"box_dir": "./mail", "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "X", "input_prefix": "> "},
+        agent_entry,
+    ]}
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    return cfg
+
+
+def test_an_unknown_role_without_tmux_is_refused_not_labelled_api(tmp_path, monkeypatch, capsys):
+    """THE oracle of F-977: no tmux used to mean api_consumer.
+
+    The relay persisted and then labelled ANY tmux-less recipient `NUDGE
+    api_consumer`, while the bridge admitted only an explicit `mail_consumer: api`.
+    A configuration with an unknown role and no tmux had one caller treating it as
+    API and the other refusing it - the disagreement that let a mailbox nobody can
+    poll look like a working channel.
+    """
+    _cfg_with(tmp_path, {"name": "ghost", "mail_consumer": "bogus",
+                         "tmux_session": None, "busy_regex": "NEVER_MATCHES",
+                         "input_prefix": ""})
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["send", "--from", "a", "--to", "ghost", "--body", "job"]) == 1
+    captured = capsys.readouterr()          # captured ONCE: a second read is empty
+    combined = captured.out + captured.err
+    assert "api_consumer" not in combined
+    assert "unknown" in combined.lower()
+
+
+def test_the_query_answers_structurally_for_a_valid_api_agent(tmp_path, monkeypatch, capsys):
+    _cfg_with(tmp_path, {"name": "glm", "mail_consumer": "api", "tmux_session": None,
+                         "busy_regex": "NEVER_MATCHES", "input_prefix": ""})
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["check-consumer", "glm"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["role"] == "api"
+    assert payload["valid"] is True
+
+
+def test_the_query_refuses_non_zero_for_an_unknown_role(tmp_path, monkeypatch, capsys):
+    _cfg_with(tmp_path, {"name": "ghost", "mail_consumer": "bogus", "tmux_session": None,
+                         "busy_regex": "NEVER_MATCHES", "input_prefix": ""})
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["check-consumer", "ghost"]) == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["role"] == "unknown"
+    assert payload["valid"] is False
+
+
+def test_an_agent_with_tmux_and_no_declared_role_stays_a_tmux_consumer(tmp_path, monkeypatch, capsys):
+    """The regression guard: most agents declare no role and DO have a pane.
+
+    If the new rule refuses those, the change breaks the fleet it protects.
+    """
+    _cfg_with(tmp_path, {"name": "dc", "tmux_session": "dc",
+                         "busy_regex": "X", "input_prefix": "> "})
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["check-consumer", "dc"]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["role"] == "tmux"
