@@ -372,7 +372,10 @@ def redeliver_unread(
         name = agent["name"]
         # Scheduler is a sender/cron role, not a mailbox consumer.  Retrying a
         # message to it can only burn the bounded retry budget forever.
+        if agent.get("mail_consumer") == "none":
+            continue
         if not agent.get("tmux_session"):
+            # API consumers poll their durable mailbox; they need no tmux nudge.
             continue
         # This lock defines the precise safety guarantee: mail unread when the
         # decision is made is eligible. It is deliberately released before the
@@ -692,10 +695,6 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_send(config, args, guarded: bool) -> int:
     to_agent = get_agent(config, args.to)
     from_agent = get_agent(config, args.from_)
-    if not to_agent.get("tmux_session"):
-        raise RelayConfigError(
-            f"agente '{args.to}' não é destinatário interativo; não tem consumidor de mailbox"
-        )
     box_dir = resolve_box_dir(config)
 
     if guarded:
@@ -710,6 +709,13 @@ def _cmd_send(config, args, guarded: bool) -> int:
         tokens=args.tokens, sender_repo_path=from_agent.get("repo_path"),
     )
     print(f"SENT seq={seq} to={args.to}")
+
+    if to_agent.get("mail_consumer") == "none":
+        print("NUDGE no_consumer", file=sys.stderr)
+        return 1
+    if not to_agent.get("tmux_session"):
+        print("NUDGE api_consumer")
+        return 0
 
     status = nudge(to_agent, seq, args.body)
     print(f"NUDGE {status}")
