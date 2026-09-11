@@ -160,6 +160,12 @@ def append_message(
     tokens: int | None = None,
     sender_repo_path: str | None = None,
 ) -> int:
+    # F-987: a durable seq and a successful transport result are not evidence
+    # that anything was communicated.  Refuse before creating a mailbox or
+    # allocating a sequence, and keep this at the common writer boundary so
+    # neither `send`, `safe-send`, nor a future direct caller can bypass it.
+    if not body.strip():
+        raise RelaySendRefused("empty or whitespace-only body: nothing to send")
     box_dir.mkdir(parents=True, exist_ok=True)
     path = mailbox_path(box_dir, to_name)
 
@@ -703,6 +709,12 @@ def _cmd_send(config, args, guarded: bool) -> int:
     to_agent = get_agent(config, args.to)
     from_agent = get_agent(config, args.from_)
     box_dir = resolve_box_dir(config)
+
+    # This check has no side effect and avoids probing a recipient for a body
+    # that the common writer will inevitably reject.
+    if not args.body.strip():
+        print("REFUSED: empty or whitespace-only body: nothing to send", file=sys.stderr)
+        return 1
 
     if guarded:
         try:

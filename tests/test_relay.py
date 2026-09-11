@@ -184,6 +184,39 @@ def test_cli_send_to_api_consumer_persists_without_tmux_nudge(tmp_path, monkeypa
     assert relay.read_messages(relay.resolve_box_dir(cfg), "api", advance=False)[0]["body"] == "job"
 
 
+@pytest.mark.parametrize("body", ("", " \t\n "))
+def test_cli_send_rejects_blank_body_without_persisting(tmp_path, monkeypatch, capsys, body):
+    """R-FIRE F-987: unguarded send must not report SENT for a null message."""
+    cfg = {"box_dir": "./mail", "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "X", "input_prefix": "> "},
+        {"name": "api", "mail_consumer": "api", "tmux_session": None,
+         "busy_regex": "NEVER_MATCHES", "input_prefix": ""},
+    ]}
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["send", "--from", "a", "--to", "api", "--body", body]) == 1
+    captured = capsys.readouterr()
+    assert "empty or whitespace-only body" in captured.err
+    assert "SENT" not in captured.out
+    assert not (tmp_path / "mail").exists()
+
+
+def test_safe_send_rejects_blank_body_before_recipient_probe(tmp_path, monkeypatch, capsys):
+    """The common boundary refuses blank input before guarded tmux inspection."""
+    cfg = {"box_dir": "./mail", "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "X", "input_prefix": "> "},
+        {"name": "api", "mail_consumer": "api", "tmux_session": None,
+         "busy_regex": "NEVER_MATCHES", "input_prefix": ""},
+    ]}
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(relay, "check_safe_to_send",
+                        lambda *_: (_ for _ in ()).throw(AssertionError("probed")))
+    assert relay.main(["safe-send", "--from", "a", "--to", "api", "--body", " "]) == 1
+    assert "empty or whitespace-only body" in capsys.readouterr().err
+    assert not (tmp_path / "mail").exists()
+
+
 def test_cli_redeliver_returns_nonzero_on_retry_cap(tmp_path, monkeypatch):
     cfg = {"box_dir": str(tmp_path / "mail"), "agents": [
         {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},
@@ -227,6 +260,22 @@ def test_append_message_returns_seq_starting_at_1(tmp_path):
     seq2 = relay.append_message(box, "b", "a", "segunda")
     assert seq1 == 1
     assert seq2 == 2
+
+
+@pytest.mark.parametrize("body", ("", " \t\n "))
+def test_append_message_rejects_blank_body_without_creating_box(tmp_path, body):
+    """Direct writers cannot bypass the F-987 common persistence boundary."""
+    box = tmp_path / "mail"
+    with pytest.raises(relay.RelaySendRefused, match="empty or whitespace-only body"):
+        relay.append_message(box, "b", "a", body)
+    assert not box.exists()
+
+
+def test_append_message_preserves_nonblank_body_exactly(tmp_path):
+    """Validation uses strip only to decide validity; it never rewrites content."""
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "  hello\n")
+    assert relay.read_messages(box, "b", advance=False)[0]["body"] == "  hello\n"
 
 
 def test_append_message_creates_file_with_0600(tmp_path):
