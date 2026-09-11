@@ -164,6 +164,15 @@ def test_redeliver_session_absent_uses_longer_pause(tmp_path, monkeypatch):
     assert entry["next_due_at"] == now.timestamp() + 240
 
 
+def test_redeliver_skips_noninteractive_scheduler(tmp_path, monkeypatch):
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "scheduler", "tmux_session": None, "busy_regex": "NEVER_MATCHES", "input_prefix": ""},
+    ]}
+    relay.append_message(tmp_path, "scheduler", "x", "one")
+    monkeypatch.setattr(relay, "nudge", lambda *args: (_ for _ in ()).throw(AssertionError("must not nudge")))
+    assert relay.redeliver_unread(cfg, now=datetime.now(timezone.utc) + timedelta(hours=1)) == []
+
+
 def test_cli_redeliver_returns_nonzero_on_retry_cap(tmp_path, monkeypatch):
     cfg = {"box_dir": str(tmp_path / "mail"), "agents": [
         {"name": "a", "tmux_session": "a", "busy_regex": "B", "input_prefix": "> "},

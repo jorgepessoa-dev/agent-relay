@@ -158,11 +158,35 @@ def rotate_one(mailbox: Path, archive_dir: Path, keep: int, *,
                 "bytes_before": size, "bytes_after": size,
                 "trigger": None}
     old, kept = lines[: len(lines) - keep], lines[len(lines) - keep:]
+    # Delivery reads only the live mailbox.  An archived record above the
+    # recipient cursor is evidence-preserved but delivery-lost, so it MUST stay
+    # live even when that means the size target cannot be met.
+    recipient = mailbox.stem.removeprefix("to_")
+    try:
+        cursor = int((mailbox.parent / f".cursor_{recipient}").read_text().strip() or 0)
+    except (OSError, ValueError):
+        cursor = 0
+    protected = []
+    archivable = []
+    for line in old:
+        try:
+            seq = int(json.loads(line).get("seq", 0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            protected.append(line)
+            continue
+        (archivable if seq <= cursor else protected).append(line)
+    old, kept = archivable, protected + kept
     # byte budget: drop oldest kept messages until the live file fits
     if max_bytes is not None:
         def _size(seq_lines):
             return sum(len(ln.encode()) + 1 for ln in seq_lines)
         while kept and _size(kept) > max_bytes and len(kept) > 1:
+            try:
+                seq = int(json.loads(kept[0]).get("seq", 0))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                break
+            if seq > cursor:
+                break
             old.append(kept.pop(0))
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     arch = archive_dir / f"{mailbox.stem}.{stamp}.jsonl.gz"

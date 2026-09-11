@@ -370,6 +370,10 @@ def redeliver_unread(
     renudges_issued = 0
     for agent in config.get("agents", []):
         name = agent["name"]
+        # Scheduler is a sender/cron role, not a mailbox consumer.  Retrying a
+        # message to it can only burn the bounded retry budget forever.
+        if not agent.get("tmux_session"):
+            continue
         # This lock defines the precise safety guarantee: mail unread when the
         # decision is made is eligible. It is deliberately released before the
         # potentially seven-second tmux operation, so acknowledgement is never
@@ -595,7 +599,10 @@ def _classify_doctor(agent_cfg: dict, signals: dict) -> dict:
     if not session_ok:
         return {**signals, "status": STATUS_SESSION_ABSENT}
 
-    lower = pane.lower()
+    # Pane scrollback contains quoted mail.  Only the current interaction tail
+    # can establish an approval/quota block (agent_liveness uses the same rule).
+    lines = [line for line in pane.splitlines() if line.strip()]
+    lower = "\n".join(lines[-4:]).lower()
     quota_markers = tuple(agent_cfg.get("quota_markers") or ()) + DEFAULT_QUOTA_MARKERS
     quota_hit = any(m in lower for m in quota_markers)
     approval_hit = any(m.lower() in lower for m in APPROVAL_DIALOG_MARKERS)
@@ -685,6 +692,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_send(config, args, guarded: bool) -> int:
     to_agent = get_agent(config, args.to)
     from_agent = get_agent(config, args.from_)
+    if not to_agent.get("tmux_session"):
+        raise RelayConfigError(
+            f"agente '{args.to}' não é destinatário interativo; não tem consumidor de mailbox"
+        )
     box_dir = resolve_box_dir(config)
 
     if guarded:
