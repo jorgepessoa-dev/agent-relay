@@ -31,6 +31,13 @@ agents:
   input_prefix: '> '
   repo_path: /opt/tradingadvisor
 - name: scheduler
+  mail_consumer: none
+  tmux_session: null
+  busy_regex: NEVER_MATCHES
+  input_prefix: ''
+  repo_path: /opt/tradingadvisor
+- name: glm
+  mail_consumer: api
   tmux_session: null
   busy_regex: NEVER_MATCHES
   input_prefix: ''

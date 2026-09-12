@@ -1,7 +1,9 @@
 import json
 import stat
 import threading
+import yaml
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -790,3 +792,42 @@ def test_an_agent_with_tmux_and_no_declared_role_stays_a_tmux_consumer(tmp_path,
     monkeypatch.chdir(tmp_path)
     assert relay.main(["check-consumer", "dc"]) == 0
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["role"] == "tmux"
+
+
+# ── F-977: the RECOVERY template must contain a valid API consumer ───────────
+
+def _example_config():
+    """The tracked recovery template: the only PORTABLE config there is.
+
+    The live relay.yaml is gitignored, so on a fresh host this file IS the whole
+    configuration. If it lacks the roles the live one has, a recovered system refuses
+    the agents the live one serves - which is what the re-review found.
+    """
+    # Resolved from THIS file, not relay.__file__, which can point at a .pyc inside
+    # __pycache__ and would look for the template in the wrong directory.
+    path = Path(__file__).resolve().parents[1] / "relay.yaml.example"
+    return yaml.safe_load(path.read_text())
+
+
+def test_the_recovery_template_validates_glm_as_an_api_consumer():
+    cfg = _example_config()
+    glm = next(a for a in cfg["agents"] if a["name"] == "glm")
+    assert relay.consumer_role(glm) == "api"
+    answer = relay.check_consumer(cfg, "glm")
+    assert answer["valid"] is True and answer["role"] == "api"
+
+
+def test_the_recovery_template_declares_scheduler_as_none_not_unknown():
+    """`none` is a DECLARED refusal, recorded after the append (F-979); `unknown` is a
+    configuration error refused BEFORE it. A recovered host must behave like the live
+    one, not like a misconfigured one."""
+    assert relay.check_consumer(_example_config(), "scheduler")["role"] == "none"
+
+
+def test_removing_the_api_consumer_from_the_template_makes_it_fire():
+    cfg = _example_config()
+    cfg["agents"] = [a for a in cfg["agents"] if a["name"] != "glm"]
+    answer = relay.check_consumer(cfg, "glm")
+    assert answer["valid"] is False
+    assert answer["role"] == "unknown"
+
