@@ -617,11 +617,18 @@ def _classify_doctor(agent_cfg: dict, signals: dict) -> dict:
     # Pane scrollback contains quoted mail.  Only the current interaction tail
     # can establish an approval/quota block (agent_liveness uses the same rule).
     lines = [line for line in pane.splitlines() if line.strip()]
-    lower = "\n".join(lines[-4:]).lower()
-    approval_tail = "\n".join(lines[-APPROVAL_SCAN_TAIL_LINES:]).lower()
+    # WHITESPACE IS COLLAPSED before matching, because the pane WRAPS the message:
+    # measured 2026-09-12, codex printed "...purchase more credits or try" / "again at
+    # 1:09 PM.", so the marker "try again at" never matched the raw "\n"-joined tail and
+    # a quota-blocked agent was classified IDLE (the watchdog then asked it for a
+    # priority instead of escalating the block). Same class as the doctor confusion:
+    # session/prompt state is not the ability to respond.
+    lower = " ".join("\n".join(lines[-4:]).split()).lower()
+    approval_tail = " ".join("\n".join(lines[-APPROVAL_SCAN_TAIL_LINES:]).split()).lower()
     quota_markers = tuple(agent_cfg.get("quota_markers") or ()) + DEFAULT_QUOTA_MARKERS
-    quota_hit = any(m in lower for m in quota_markers)
-    approval_hit = any(m.lower() in approval_tail for m in APPROVAL_DIALOG_MARKERS)
+    quota_hit = any(" ".join(m.split()).lower() in lower for m in quota_markers)
+    approval_hit = any(" ".join(m.lower().split()) in approval_tail
+                       for m in APPROVAL_DIALOG_MARKERS)
 
     # Script agents (no TUI: busy_regex NEVER_MATCHES and no placeholder) never
     # show a prompt — without this they are misclassified as stuck_mid_turn.

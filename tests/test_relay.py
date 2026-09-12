@@ -626,6 +626,28 @@ def test_doctor_ignores_approval_marker_outside_interaction_window():
     assert result["status"] == relay.STATUS_IDLE
 
 
+def test_doctor_marks_quota_when_the_message_wraps_across_lines():
+    """Measured 2026-09-12 on the real codex pane: the usage-limit text WRAPS.
+
+    "...purchase more credits or try" / "again at 1:09 PM." straddles a newline, so the
+    marker "try again at" never matched the raw "\\n"-joined tail and a quota-blocked
+    agent was classified IDLE - the watchdog then ASKED it for a priority instead of
+    escalating the block. Session/prompt state is not the ability to respond.
+    """
+    pane = (
+        "previous turn\n"
+        "\u25a0 You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro),\n"
+        "visit https://chatgpt.com/codex/settings/usage to purchase more credits or try\n"
+        "again at 1:09 PM.\n"
+        "\u203a Ask Codex to do anything\n"
+        "gpt-5.6-terra medium \u00b7 /opt/tradingadvisor \u00b7 Executar boot e verificar \u00b7 Main\u2026\n"
+    )
+    with patch("relay.tmux_has_session", return_value=True), \
+         patch("relay.tmux_capture_pane", return_value=(True, pane)):
+        result = relay.doctor_check(AGENT)
+    assert result["status"] == relay.STATUS_QUOTA
+
+
 def test_cli_send_then_read_roundtrip(tmp_path, monkeypatch):
     cfg = {
         "box_dir": "./mail",
