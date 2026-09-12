@@ -1,4 +1,5 @@
 import json
+import re
 import stat
 import threading
 import yaml
@@ -815,6 +816,59 @@ def test_the_recovery_template_validates_glm_as_an_api_consumer():
     assert relay.consumer_role(glm) == "api"
     answer = relay.check_consumer(cfg, "glm")
     assert answer["valid"] is True and answer["role"] == "api"
+
+
+def _recover_into(tmp_path, source="relay.yaml.example"):
+    """What an operator does: copy the tracked template, then run against the copy."""
+    import shutil
+
+    src = Path(__file__).resolve().parents[1] / source
+    text = src.read_text()
+    # The tracked template carries the LIVE absolute box_dir, so a naive copy writes
+    # into the production mailbox - which is what happened when this test was first
+    # written, and is exactly the side effect a recovery test must not have.
+    rewritten, n = re.subn(r"(?m)^box_dir:.*$", "box_dir: ./mail", text)
+    assert n == 1, f"expected exactly one box_dir line, found {n}"
+    (tmp_path / "relay.yaml").write_text(rewritten)
+    return tmp_path / "relay.yaml"
+
+
+def test_recovery_processes_a_real_send_and_preserves_the_append_for_none(tmp_path, monkeypatch, capsys):
+    """`none` is DECLARED, so its refusal is recorded after the append (F-979).
+
+    The previous version asserted the predicate, which is not the same claim: what
+    matters is that the delivery is attempted and recorded, not refused before anything
+    exists.
+    """
+    _recover_into(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["send", "--from", "deepcode", "--to", "scheduler",
+                       "--body", "job"]) == 1
+    captured = capsys.readouterr()
+    assert "SENT" in captured.out, "a declared none keeps the append"
+    assert (tmp_path / "mail" / "to_scheduler.jsonl").exists()
+    assert "no_consumer" in captured.err
+
+
+def test_a_generic_template_refuses_and_names_the_recovery_one(tmp_path, monkeypatch, capsys):
+    """Recovering from the generic relay.example.yaml is the WRONG template: it has no
+    api consumer, so the refusal must name the tracked file to use instead."""
+    _recover_into(tmp_path, source="relay.example.yaml")
+    monkeypatch.chdir(tmp_path)
+    assert relay.main(["check-consumer", "glm"]) == 1
+    assert "relay.yaml.example" in capsys.readouterr().err
+
+
+def test_altering_the_api_role_away_fires_not_only_removing_the_agent():
+    """R-FIRE (c): removing the agent is one way to lose the consumer; changing its role
+    is another, and the coverage must fire on both."""
+    cfg = _example_config()
+    for agent in cfg["agents"]:
+        if agent["name"] == "glm":
+            agent["mail_consumer"] = "none"
+    answer = relay.check_consumer(cfg, "glm")
+    assert answer["valid"] is False
+    assert answer["role"] == "none"
 
 
 def test_the_recovery_template_declares_scheduler_as_none_not_unknown():

@@ -728,7 +728,8 @@ def _cmd_send(config, args, guarded: bool) -> int:
     if role == "unknown":
         print(f"REFUSED: {args.to!r} declares mail_consumer="
               f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so the role is unknown and no consumer can be established; "
-              f"nothing was written (F-977)",
+              f"nothing was written (F-977). "
+              f"{REL_TEMPLATE_HINT}",
               file=sys.stderr)
         return 1
 
@@ -830,6 +831,10 @@ def _cmd_redeliver(config) -> int:
 #: working channel (F-977).
 CONSUMER_ROLES = ("tmux", "api", "none")
 
+#: Named in every refusal, so an operator who recovered from the generic
+#: relay.example.yaml learns which tracked template is correct (F-977).
+REL_TEMPLATE_HINT = "the tracked recovery template is relay.yaml.example"
+
 
 def consumer_role(agent: dict) -> str:
     """THE ONE consumer-configuration rule (F-977).
@@ -874,8 +879,8 @@ def _cmd_check_consumer(config: dict, args) -> int:
     print(json.dumps(answer, ensure_ascii=False))
     if answer["valid"]:
         return 0
-    print(f"REFUSED: {args.agent!r} is not a valid consumer: {answer['reason']}",
-          file=sys.stderr)
+    print(f"REFUSED: {args.agent!r} is not a valid consumer: {answer['reason']} "
+          f"{REL_TEMPLATE_HINT}", file=sys.stderr)
     return 1
 
 
