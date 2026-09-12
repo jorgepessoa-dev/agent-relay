@@ -727,8 +727,7 @@ def _cmd_send(config, args, guarded: bool) -> int:
     role = consumer_role(to_agent)
     if role == "unknown":
         print(f"REFUSED: {args.to!r} declares mail_consumer="
-              f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so no "
-              f"the role is unknown and no consumer can be established; "
+              f"{to_agent.get('mail_consumer')!r} and has no tmux_session, so the role is unknown and no consumer can be established; "
               f"nothing was written (F-977)",
               file=sys.stderr)
         return 1
