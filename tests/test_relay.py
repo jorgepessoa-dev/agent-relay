@@ -819,7 +819,14 @@ def test_the_recovery_template_validates_glm_as_an_api_consumer():
 
 
 def _recover_into(tmp_path, source="relay.yaml.example"):
-    """What an operator does: copy the tracked template, then run against the copy."""
+    """TEST FIXTURE ONLY - this is not the recovery mechanism.
+
+    It copies the tracked template and then REWRITES box_dir into tmp_path, which is a
+    local substitution - and criterion 5 (5ff1e38) says the allowed substitutions are
+    NONE. It exists so these tests never touch the production mailbox, and no reader
+    should mistake it for a production recovery path. See
+    docs/F977_CRITERIA_5_6_NON_REPRODUCIBLE_2026_09_12.md.
+    """
     import shutil
 
     src = Path(__file__).resolve().parents[1] / source
