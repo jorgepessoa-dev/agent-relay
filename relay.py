@@ -491,8 +491,15 @@ def _input_box_clear(pane: str, to_agent: dict, seq: int) -> bool:
     return f"MAIL seq={seq}" not in current_input
 
 
-def nudge(to_agent: dict, seq: int, body: str) -> str:
+def nudge(to_agent: dict, seq: int, body: str, *, require_ready: bool = False) -> str:
     """Push a mailbox notification into the recipient's tmux pane.
+
+    F-1017: with require_ready=True (the NORMAL send path) this refuses to TYPE while
+    the pane is mid-turn or its input box already holds unsent text, returning the
+    typed status "pending" instead. The mail is already appended durably by the
+    caller, so PENDING is not an error and the existing redelivery path nudges later.
+    session_absent / capture_failed / awaiting_approval are detected below and never
+    type, so they keep their own distinct statuses in both modes.
 
     Never returns "delivered" unless the session was confirmed present and
     the post-send capture succeeded — the original relay conflated "capture
@@ -522,6 +529,15 @@ def nudge(to_agent: dict, seq: int, body: str) -> str:
         return "capture_failed"
     if any(marker in pane for marker in APPROVAL_DIALOG_MARKERS):
         return "awaiting_approval"
+    # F-1017: with require_ready (the NORMAL send path) do not TYPE while the pane is
+    # mid-turn or its input box already holds unsent text. These are the SAME
+    # single-source helpers check_safe_to_send uses, so this gate cannot drift from the
+    # pre-append refusal. PENDING is not an error - the caller already appended the
+    # mail durably; redelivery nudges later.
+    if require_ready and (
+        _unsent_input_text(to_agent, pane) is not None or _pane_mid_turn(to_agent, pane)
+    ):
+        return "pending"
 
     first = body[:180].replace("\n", " ").replace('"', "'")
     msg = f"[MAIL seq={seq}] {first}... -> relay.py read --as {to_agent['name']}"
@@ -549,6 +565,31 @@ def nudge(to_agent: dict, seq: int, body: str) -> str:
     return "stuck"
 
 
+def _unsent_input_text(agent_cfg: dict, pane: str) -> str | None:
+    """The last input-box line when it already holds UNSENT text, else None.
+
+    F-1017 single source of truth: shared by check_safe_to_send (the pre-append
+    refusal used by `safe-send` and redelivery) and by nudge's readiness gate (the
+    normal path), so the two can never diverge on what "the box already has text"
+    means.
+    """
+    box_lines = [l for l in pane.splitlines() if l.startswith(agent_cfg["input_prefix"])]
+    if not box_lines:
+        return None
+    last = box_lines[-1]
+    if agent_cfg.get("placeholder", DEFAULT_PLACEHOLDER) in last:
+        return None
+    return last
+
+
+def _pane_mid_turn(agent_cfg: dict, pane: str) -> bool:
+    """True when the pane's recent tail matches the recipient's busy_regex.
+
+    F-1017 single source of truth, shared exactly as _unsent_input_text is.
+    """
+    return bool(re.search(agent_cfg["busy_regex"], "\n".join(pane.splitlines()[-14:])))
+
+
 def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BODY_LEN) -> None:
     session = agent_cfg["tmux_session"]
     if not tmux_has_session(session):
@@ -558,21 +599,15 @@ def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BO
     if not ok:
         raise RelaySendRefused(f"capture-pane falhou para '{session}'")
 
-    lines = pane.splitlines()
-    prefix = agent_cfg["input_prefix"]
-    placeholder = agent_cfg.get("placeholder", DEFAULT_PLACEHOLDER)
-    box_lines = [l for l in lines if l.startswith(prefix)]
-    if box_lines:
-        last = box_lines[-1]
-        if placeholder not in last:
-            raise RelaySendRefused(
-                f"caixa de input já tem texto por enviar: {last[:60]!r}"
-            )
+    last = _unsent_input_text(agent_cfg, pane)
+    if last is not None:
+        raise RelaySendRefused(
+            f"caixa de input já tem texto por enviar: {last[:60]!r}"
+        )
 
-    recent = "\n".join(lines[-14:])
     if any(marker in pane for marker in APPROVAL_DIALOG_MARKERS):
         raise RelaySendRefused(f"'{session}' está a aguardar aprovação")
-    if re.search(agent_cfg["busy_regex"], recent):
+    if _pane_mid_turn(agent_cfg, pane):
         raise RelaySendRefused(f"'{session}' está a meio de turno")
 
     if len(body) > max_len:
@@ -760,7 +795,13 @@ def _cmd_send(config, args, guarded: bool) -> int:
         print("NUDGE api_consumer")
         return 0
 
-    status = nudge(to_agent, seq, args.body)
+    # F-1017: the NORMAL (unguarded) path asks nudge to CONFIRM READINESS before it
+    # types (require_ready). The mail is already appended durably, so an unready pane
+    # is NOT an error: it becomes the typed PENDING state and the existing redelivery
+    # path nudges later. `safe-send` already refused PRE-append in the guarded branch
+    # above, so its contract is unchanged. The gate lives INSIDE nudge, the single
+    # place that types - so a busy/dirty pane gets ZERO send-keys.
+    status = nudge(to_agent, seq, args.body, require_ready=not guarded)
     print(f"NUDGE {status}")
     if args.delivery_json:
         print("DELIVERY_RESULT " + json.dumps({
