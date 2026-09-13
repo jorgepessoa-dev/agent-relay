@@ -917,15 +917,16 @@ def test_removing_the_api_consumer_from_the_template_makes_it_fire():
 
 def test_normal_send_appends_durably_but_never_types_into_a_busy_pane(tmp_path, monkeypatch, capsys):
     """F-1017: the normal send path (guarded=False) appends the mail durably but must NOT
-    type into a busy/dirty pane. The nudge becomes a typed PENDING state - the message
-    stays in the mailbox for the existing redelivery path (not delivered, not lost) - and
-    ZERO tmux send-keys calls are made. Driven by a CAPTURED pane, not by mocking the
-    caller chain."""
+    type into a BUSY pane whose input box is otherwise clean and visible. The nudge becomes
+    a typed PENDING state - the message stays in the mailbox for the existing redelivery
+    path - and ZERO tmux send-keys calls are made. Driven by a CAPTURED pane, not by
+    mocking the caller chain."""
     cfg = {"box_dir": str(tmp_path), "agents": [
         {"name": "a", "tmux_session": "a", "busy_regex": "BUSY", "input_prefix": "> "},
     ]}
     monkeypatch.setattr(relay, "tmux_has_session", lambda session: True)
-    monkeypatch.setattr(relay, "tmux_capture_pane", lambda session: (True, "BUSY working\n> "))
+    monkeypatch.setattr(relay, "tmux_capture_pane",
+                        lambda session: (True, "BUSY working\n> Type your message"))
     monkeypatch.setattr(relay.time, "sleep", lambda *_a: None)
     typed = []
     monkeypatch.setattr(relay.subprocess, "run", lambda argv, **kw: typed.append(list(argv)))
@@ -942,14 +943,42 @@ def test_normal_send_appends_durably_but_never_types_into_a_busy_pane(tmp_path, 
     assert rc == 2
 
 
+def test_normal_send_does_not_type_into_a_pane_without_a_visible_prompt(tmp_path, monkeypatch, capsys):
+    """F-1017 VETO counterexample (Codex, independent E2E), kept as the hardened test: a pane
+    whose OLD busy marker scrolled out of the tail and that shows NO input prompt is NOT
+    ready - it is an occupied pane. Absence of a busy match is NOT readiness, so the gate
+    demands POSITIVE evidence of the input box and answers PENDING, fail-closed, with zero
+    send-keys. (This is the adjacent the hardened method names: it satisfies the old
+    predicate and fails the claim.)"""
+    cfg = {"box_dir": str(tmp_path), "agents": [
+        {"name": "a", "tmux_session": "a", "busy_regex": "BUSY", "input_prefix": "> "},
+    ]}
+    pane = "BUSY\n" + "\n".join(f"line {i}" for i in range(20))
+    monkeypatch.setattr(relay, "tmux_has_session", lambda session: True)
+    monkeypatch.setattr(relay, "tmux_capture_pane", lambda session: (True, pane))
+    monkeypatch.setattr(relay.time, "sleep", lambda *_a: None)
+    typed = []
+    monkeypatch.setattr(relay.subprocess, "run", lambda argv, **kw: typed.append(list(argv)))
+    args = relay.build_parser().parse_args(
+        ["send", "--from", "a", "--to", "a", "--body", "hello",
+         "--require-delivery", "--delivery-json"])
+    rc = relay._cmd_send(cfg, args, guarded=False)
+    out = capsys.readouterr().out
+    assert [m["body"] for m in relay.read_messages(tmp_path, "a", advance=False)] == ["hello"]
+    assert [c for c in typed if "send-keys" in c] == []      # ZERO send-keys
+    assert "NUDGE pending" in out and rc == 2
+
+
 def test_normal_send_nudges_exactly_once_when_the_pane_is_ready(tmp_path, monkeypatch, capsys):
-    """Control: a ready, clear pane keeps the normal ONE-message nudge (its text plus the
-    Enter) and exit 0 - the readiness gate must not become a general refusal."""
+    """Control: a READY pane - a clean input box VISIBLE (the positive evidence) and no busy
+    match - keeps the normal ONE-message nudge (its text plus the Enter) and exit 0. The
+    readiness gate must not become a general refusal."""
     cfg = {"box_dir": str(tmp_path), "agents": [
         {"name": "a", "tmux_session": "a", "busy_regex": "BUSY", "input_prefix": "> "},
     ]}
     monkeypatch.setattr(relay, "tmux_has_session", lambda session: True)
-    monkeypatch.setattr(relay, "tmux_capture_pane", lambda session: (True, "ready\n"))
+    monkeypatch.setattr(relay, "tmux_capture_pane",
+                        lambda session: (True, "ready\n> Type your message"))
     monkeypatch.setattr(relay.time, "sleep", lambda *_a: None)
     typed = []
     monkeypatch.setattr(relay.subprocess, "run", lambda argv, **kw: typed.append(list(argv)))

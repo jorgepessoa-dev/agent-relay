@@ -534,8 +534,18 @@ def nudge(to_agent: dict, seq: int, body: str, *, require_ready: bool = False) -
     # single-source helpers check_safe_to_send uses, so this gate cannot drift from the
     # pre-append refusal. PENDING is not an error - the caller already appended the
     # mail durably; redelivery nudges later.
+    # ROOT DECLARED (same root the independent VETO found): a readiness predicate WEAKER
+    # than the claim it supports. The claim is "this pane is ready to be typed into"; the
+    # predicate must therefore require POSITIVE evidence (the input box on screen), not
+    # merely the ABSENCE of a busy marker - an occupied pane, or one whose marker scrolled
+    # out of the tail, satisfied the old predicate and was typed into anyway. METHOD
+    # HARDENED: for each guard, name the object that satisfies the predicate and fails the
+    # claim - here "a pane with no prompt and no busy match in the tail" - and keep it as a
+    # test. busy/unsent remain ADDITIONAL blocks; a missing prompt is PENDING, fail-closed.
     if require_ready and (
-        _unsent_input_text(to_agent, pane) is not None or _pane_mid_turn(to_agent, pane)
+        not _input_prompt_visible(to_agent, pane)
+        or _unsent_input_text(to_agent, pane) is not None
+        or _pane_mid_turn(to_agent, pane)
     ):
         return "pending"
 
@@ -588,6 +598,25 @@ def _pane_mid_turn(agent_cfg: dict, pane: str) -> bool:
     F-1017 single source of truth, shared exactly as _unsent_input_text is.
     """
     return bool(re.search(agent_cfg["busy_regex"], "\n".join(pane.splitlines()[-14:])))
+
+
+def _input_prompt_visible(agent_cfg: dict, pane: str) -> bool:
+    """POSITIVE evidence that the agent's input box is on screen (F-1017).
+
+    The independent VETO proved the ROOT: *a readiness predicate WEAKER than the claim
+    it supports*. The absence of a busy marker does NOT establish readiness - an occupied
+    pane (a live foreground process, or a marker that scrolled out of the tail) has no
+    busy match yet is NOT at its input box, and typing would go nowhere. So the gate now
+    demands POSITIVE evidence: a tail line starting with the recipient's input_prefix.
+    Measured on the live panes: deepcode shows ">   Type your message...", codex
+    "Ask Codex to do anything", coordinator its chevron prompt - all inside the tail
+    window. An empty prefix means the agent has no observable input box (role none/api),
+    where this requirement does not apply.
+    """
+    prefix = agent_cfg.get("input_prefix") or ""
+    if not prefix:
+        return True  # no observable input box configured -> requirement not applicable
+    return any(l.startswith(prefix) for l in pane.splitlines()[-14:])
 
 
 def check_safe_to_send(agent_cfg: dict, body: str, max_len: int = DEFAULT_MAX_BODY_LEN) -> None:
