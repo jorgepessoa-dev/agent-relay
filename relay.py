@@ -741,6 +741,120 @@ def doctor_check(agent_cfg: dict) -> dict:
     return _classify_doctor(agent_cfg, signals)
 
 
+def _mailbox_rows(box_dir: Path, name: str) -> list[dict]:
+    path = mailbox_path(box_dir, name)
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _redelivery_entry(box_dir: Path, name: str, seq: int) -> dict:
+    state = _read_redelivery_state(box_dir)
+    entry = (state.get("entries") or {}).get(_entry_key(name, seq))
+    return entry if isinstance(entry, dict) else {}
+
+
+def _row_age_s(row: dict, now: datetime) -> float | None:
+    return _record_age_s(row, now)
+
+
+def delivery_record(box_dir: Path, name: str, seq: int, *, now: datetime | None = None) -> dict:
+    """The transport fact for one (recipient, seq).
+
+    `mailbox_persisted` is whether the durable mailbox has the row. `notification_state` is one of delivered, pending or
+    unknown, and it is computed from evidence that already exists: the read cursor having passed the sequence (a read
+    implies the notification happened) or a redelivery attempt that reported delivered. `unknown` is for a sequence the
+    mailbox does not have - absence is not a delivery.
+
+    This function PROVES NOTHING ABOUT WORK. A delivered notification says the seq left the recipient's input box; it
+    says nothing about reading, understanding, or the request being carried out. That is the outcome receipt's job, and
+    the design keeps them separate on purpose.
+    """
+    moment = now or datetime.now(UTC)
+    rows = _mailbox_rows(box_dir, name)
+    row = next((r for r in rows if r.get("seq") == seq), None)
+    if row is None:
+        return {"recipient": name, "seq": seq, "mailbox_persisted": False,
+                "notification_state": "unknown", "notification_attempts": [],
+                "pending_age_seconds": None, "last_reason": "no mailbox row for this sequence"}
+
+    entry = _redelivery_entry(box_dir, name, seq)
+    attempts: list[dict] = []
+    if entry:
+        attempts.append({"at": entry.get("last_nudged_at"), "result": entry.get("last_status")})
+
+    cursor = read_cursor(box_dir, name)
+    status = str(entry.get("last_status") or "")
+    if status == "delivered" or cursor >= seq:
+        state, reason = "delivered", (status or f"the read cursor reached {cursor}")
+    else:
+        state = "pending"
+        reason = status or "no delivery evidence recorded yet"
+
+    return {
+        "recipient": name, "seq": seq,
+        "mailbox_persisted": True,
+        "notification_state": state,
+        "notification_attempts": attempts,
+        "pending_age_seconds": None if state == "delivered" else _row_age_s(row, moment),
+        "created_at": row.get("ts_utc"),
+        "last_reason": reason,
+    }
+
+
+def pending_deliveries(box_dir: Path, *, limit: int = 20, now: datetime | None = None) -> list[dict]:
+    """A BOUNDED list of sequences whose notification has not been confirmed, OLDEST FIRST.
+
+    The bound and the ordering are the point: the aged row is the one stuck, and a list that cannot be bounded is a list
+    nobody reads. The design asks for aged pending rows to surface without a manual `doctor` loop.
+    """
+    moment = now or datetime.now(UTC)
+    out: list[dict] = []
+    for path in sorted(box_dir.glob("to_*.jsonl")):
+        name = path.name[len("to_"): -len(".jsonl")]
+        for row in _mailbox_rows(box_dir, name):
+            seq = row.get("seq")
+            if not isinstance(seq, int):
+                continue
+            record = delivery_record(box_dir, name, seq, now=moment)
+            if record["notification_state"] != "delivered":
+                out.append(record)
+    out.sort(key=lambda r: (r.get("pending_age_seconds") or 0), reverse=True)
+    return out[: max(0, int(limit))]
+
+
+def sender_report(*, delivery_record: dict) -> str:
+    """What a sender is ALLOWED to say, derived from the record rather than chosen by the sender.
+
+    The design's reporting rule, and the sentence this exists to prevent: until the notification is confirmed, the only
+    honest report is "mailbox persisted; notification pending". After it is confirmed, "notification confirmed" - and
+    never "processed", because that is a different fact with a different producer (the outcome receipt).
+    """
+    state = delivery_record.get("notification_state")
+    seq = delivery_record.get("seq")
+    # THE RECIPIENT IS PART OF THE REPORT. Found by running the real list: without it, four rows reading
+    # "pending 740711s" could not be attributed to a mailbox, so an operator could see that something was stuck for
+    # eight days and not know whose queue it was. A receipt that cannot say WHERE is half a receipt.
+    who = delivery_record.get("recipient") or "?"
+    if state == "delivered":
+        return f"{who} seq {seq}: mailbox persisted; notification confirmed (not processed)"
+    if state == "pending":
+        age = delivery_record.get("pending_age_seconds")
+        age_txt = f", pending {age:.0f}s" if isinstance(age, (int, float)) else ""
+        return f"{who} seq {seq}: mailbox persisted; notification pending{age_txt}"
+    return f"{who} seq {seq}: no mailbox row; nothing persisted to report"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="relay.py")
     p.add_argument("--config", default=None, help="caminho para relay.yaml/relay.json")
@@ -772,6 +886,12 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor")
     d.add_argument("--agent", required=True)
     redeliver = sub.add_parser("redeliver")
+    ds = sub.add_parser("delivery-status", help="the transport fact for one (recipient, seq)")
+    ds.add_argument("--recipient", required=True)
+    ds.add_argument("--seq", type=int, required=True)
+    pend = sub.add_parser("pending", help="bounded list of unconfirmed notifications, oldest first")
+    pend.add_argument("--limit", type=int, default=20)
+
     redeliver.add_argument("--due", action="store_true",
                            help="compatibility marker: only due mail is swept")
 
@@ -892,6 +1012,34 @@ def _cmd_doctor(config, args) -> int:
     return 0
 
 
+def _cmd_delivery_status(config, args) -> int:
+    """The transport fact for one (recipient, seq), plus what a SENDER may say about it.
+
+    Separate from `doctor` on purpose: doctor has no sequence input and is session health, never a receipt. Asking
+    "did seq N leave the box" is this command's whole job."""
+    box_dir = resolve_box_dir(config)
+    get_agent(config, args.recipient)
+    record = delivery_record(box_dir, args.recipient, args.seq)
+    if getattr(args, "json", False):
+        print(json.dumps(record, sort_keys=True))
+    else:
+        print(json.dumps(record, indent=2, sort_keys=True))
+        print(sender_report(delivery_record=record))
+    return 0
+
+
+def _cmd_pending(config, args) -> int:
+    """A bounded list of unconfirmed notifications, oldest first - the stuck ones surface without a doctor loop."""
+    box_dir = resolve_box_dir(config)
+    rows = pending_deliveries(box_dir, limit=args.limit)
+    if not rows:
+        print("pending: none (every persisted sequence has a confirmed notification)")
+        return 0
+    for record in rows:
+        print(sender_report(delivery_record=record))
+    return 0
+
+
 def _cmd_redeliver(config) -> int:
     escalated = False
     for name, seq, status in redeliver_unread(config):
@@ -986,6 +1134,10 @@ def main(argv=None) -> int:
             return _cmd_check_consumer(config, args)
         if args.cmd == "redeliver":
             return _cmd_redeliver(config)
+        if args.cmd == "delivery-status":
+            return _cmd_delivery_status(config, args)
+        if args.cmd == "pending":
+            return _cmd_pending(config, args)
     except RelayConfigError as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
         return 1
