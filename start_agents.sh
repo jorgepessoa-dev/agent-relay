@@ -39,7 +39,11 @@ start_session gemini bash -lc "cd /opt/tradingadvisor && .venv/bin/python script
 # glm and glm-builder were LIVE and NOT named here, measured 2026-09-20 against the six running sessions - so a reboot
 # would have taken them away silently, with nobody told. Both invocations are copied from the running panes rather
 # than invented, including glm's log path and its thirty-second poll, and glm-builder's isolated worktree.
-start_session glm bash -lc "cd /opt/tradingadvisor && .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 2; exec bash -lc 'while true; do .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 30; done'"
+# DEACTIVATED 2026-09-20 (F-1462): reachable-but-dormant, and measured WORSE than dormant - the mailbox has
+# taken nothing for 107 hours (cursor 61 of 61) while glm-builder took 238 messages, AND the loop spins
+# writing the same line, 1.2MB of identical text in the log. Superseded, and not quiet about it.
+# The module is untouched; reactivation needs a prereg, the missing ack, and an E2E run.
+# start_session glm bash -lc "cd /opt/tradingadvisor && .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 2; exec bash -lc 'while true; do .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 30; done'"
 start_session glm-builder bash -lc "cd /opt/tradingadvisor/.worktrees/glm-builder && /root/.nvm/versions/node/v24.19.0/bin/deepcode"
 
 if [ "${START_COORDINATOR:-0}" = "1" ]; then
