@@ -373,7 +373,11 @@ def _run(returncode=0, stdout=""):
 def test_tmux_has_session_true(monkeypatch):
     with patch("subprocess.run", return_value=_run(returncode=0)) as mock_run:
         assert relay.tmux_has_session("sess") is True
-        assert mock_run.call_args[0][0] == ["tmux", "has-session", "-t", "sess"]
+        # EXACT form, corrected 2026-09-20 (LANE C): tmux resolves a bare name by PREFIX, so the
+        # transport asks for `=sess`. This assertion was left behind when the fix landed in
+        # relay.py — a stale test in the repo that OWNS the code, found while running this repo's
+        # suite as the regression check for the F5 consumption lock.
+        assert mock_run.call_args[0][0] == ["tmux", "has-session", "-t", "=sess"]
 
 
 def test_tmux_has_session_false(monkeypatch):

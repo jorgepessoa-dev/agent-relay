@@ -330,6 +330,43 @@ def _clear_redelivery_through_state(state: dict, name: str, seq: int) -> bool:
     return removed
 
 
+
+@contextmanager
+def _consume_lock(box_dir: Path, name: str):
+    """EXCLUSIVE consumption lock for one mailbox key (F5, 2026-09-20).
+
+    WHY: `read_messages` read the unread set and only afterwards advanced the cursor, so two
+    consumers overlapping in time BOTH read the same messages — measured: 10 reads for 5 messages,
+    each message delivered twice. With ≥2 live sessions of one agent (or a second consumer added
+    deliberately) that is the same work done twice, and for a seat that ACTS on a message it is a
+    duplicate action. LANE C's `=name` fix removed the accidental route to two sessions; this lock
+    covers every other route.
+
+    SCOPE OF THE FIX, stated so it is not overread: overlapping consumers now PARTITION the unread
+    set (the later one finds what the earlier has not taken). Sequential behaviour is unchanged, and
+    a consumer that arrives late still sees anything the earlier one left — nothing can be lost.
+    `peek` deliberately does NOT take this lock: it is a reader, not a consumer.
+
+    The lock file is distinct from the mailbox and never matches the mailbox/archive globs.
+    """
+    lock_path = box_dir / f".lock_{name}"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as fh:
+        # Bounded polite wait, then a BLOCKING acquire: a timeout that gave up would re-create the
+        # very defect (two consumers taking the same set), so waiting is the correct failure mode.
+        for _ in range(40):                       # ~2s of non-blocking attempts
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
 def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
     path = mailbox_path(box_dir, name)
     if not path.exists():
@@ -353,11 +390,18 @@ def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
         except json.JSONDecodeError:
             # A torn/corrupt line must not suppress delivery of later valid mail.
             continue
-    seen = read_cursor(box_dir, name)
-    unread = [r for r in records if r["seq"] > seen]
+    if not advance:
+        seen = read_cursor(box_dir, name)
+        return [r for r in records if r["seq"] > seen]
 
-    if advance and unread:
-        write_cursor_atomic(box_dir, name, unread[-1]["seq"])
+    # BOTH the read of the cursor AND the advance happen inside the lock. My first version released
+    # the lock before writing the cursor, which re-created the race the lock exists to remove: the
+    # second consumer would acquire the lock, still see the old cursor, and take the same set again.
+    with _consume_lock(box_dir, name):
+        seen = read_cursor(box_dir, name)
+        unread = [r for r in records if r["seq"] > seen]
+        if unread:
+            write_cursor_atomic(box_dir, name, unread[-1]["seq"])
 
     return unread
 
