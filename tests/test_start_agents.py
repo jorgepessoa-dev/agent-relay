@@ -26,12 +26,27 @@ SCRIPT = pathlib.Path("/opt/agent-relay/start_agents.sh")
 SCRIPT_TEXT = SCRIPT.read_text(encoding="utf-8")
 
 
-def test_the_script_names_every_agent_that_must_survive_a_reboot():
-    """The measured gap: glm-builder and glm. A session that is not named here does not come back after a reboot, and
-    the loss is silent - the agent is simply gone and nobody is told."""
-    for name in ("deepcode", "codex", "gemini", "glm-builder", "glm"):
-        assert f"start_session {name}" in SCRIPT_TEXT, (
-            f"{name} is not started by the reboot script; it exists live today and would not survive a reboot")
+def test_the_script_names_every_session_the_relay_declares():
+    """The measured gap: glm-builder and glm did not come back after a reboot, and the loss is silent.
+
+    LANE A (2026-09-20) separated IDENTITY from SESSION: the agent keeps `name: glm-builder` (it is the
+    mailbox key) while `tmux_session: glm53flash-1` is what tmux must start. Hardcoding the session names
+    here - as this test did - turned a rename into a failing pin and hid the property that actually
+    matters: **every session the relay DECLARES must be started by the reboot script**. So the names are
+    DERIVED from relay.yaml, which is the declaration the nudges themselves use; a rename now updates one
+    file instead of two, and a genuinely missing session still fails by name.
+    """
+    import yaml
+    cfg = yaml.safe_load(pathlib.Path("/opt/agent-relay/relay.yaml").read_text(encoding="utf-8"))
+    declared = [(a.get("name"), a.get("tmux_session")) for a in cfg.get("agents", [])]
+    sessions = [(n, s) for n, s in declared if s]
+    assert sessions, "relay.yaml declares no tmux_session: nothing to check, which is itself a defect"
+    for name, session in sessions:
+        if name == "claude":            # the human-facing seat is opt-in by design (START_COORDINATOR=1)
+            continue
+        assert f"start_session {session}" in SCRIPT_TEXT, (
+            f"{name} declares tmux_session={session} but the reboot script does not start it: it would not "
+            f"survive a reboot, and the loss is silent")
 
 
 def test_glm_builder_is_started_with_the_command_it_actually_runs_today():
@@ -39,8 +54,11 @@ def test_glm_builder_is_started_with_the_command_it_actually_runs_today():
     start an empty session that looks alive, which is worse than not starting it."""
     import re
 
-    m = re.search(r"start_session glm-builder[^\n]*", SCRIPT_TEXT)
-    assert m, "glm-builder must have a start_session line"
+    import yaml
+    cfg = yaml.safe_load(pathlib.Path("/opt/agent-relay/relay.yaml").read_text(encoding="utf-8"))
+    session = next(a["tmux_session"] for a in cfg["agents"] if a["name"] == "glm-builder")
+    m = re.search(rf"start_session {re.escape(session)}[^\n]*", SCRIPT_TEXT)
+    assert m, f"the reboot script must start the declared session {session!r} for glm-builder"
     line = m.group(0)
     assert "deepcode" in line, f"glm-builder runs deepcode today: {line}"
 

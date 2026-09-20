@@ -48,7 +48,7 @@ start_session gemini bash -lc "cd /opt/tradingadvisor && .venv/bin/python script
 # writing the same line, 1.2MB of identical text in the log. Superseded, and not quiet about it.
 # The module is untouched; reactivation needs a prereg, the missing ack, and an E2E run.
 # start_session glm bash -lc "cd /opt/tradingadvisor && .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 2; exec bash -lc 'while true; do .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 30; done'"
-start_session glm-builder bash -lc "cd /opt/tradingadvisor/.worktrees/glm-builder && /root/.nvm/versions/node/v24.19.0/bin/deepcode"
+start_session glm53flash-1 bash -lc "cd /opt/tradingadvisor/.worktrees/glm-builder && /root/.nvm/versions/node/v24.19.0/bin/deepcode"
 
 if [ "${START_COORDINATOR:-0}" = "1" ]; then
   start_session claude bash -lc "cd /opt/tradingadvisor && claude --remote-control coordinator"
