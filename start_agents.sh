@@ -1,5 +1,5 @@
 #!/bin/bash
-# Idempotent agent-session starter — restores the 4 agent tmux sessions after
+# Idempotent agent-session starter — restores the 7 agent tmux sessions after
 # reboot. Skips any session that already exists (never double-starts).
 #
 # Invocations mirror what the live sessions use today:
@@ -36,6 +36,11 @@ fi
 
 start_session codex bash -lc "cd /opt/tradingadvisor && codex resume --last"
 start_session gemini bash -lc "cd /opt/tradingadvisor && .venv/bin/python scripts/ops/gemini_agent.py"
+# glm and glm-builder were LIVE and NOT named here, measured 2026-09-20 against the six running sessions - so a reboot
+# would have taken them away silently, with nobody told. Both invocations are copied from the running panes rather
+# than invented, including glm's log path and its thirty-second poll, and glm-builder's isolated worktree.
+start_session glm bash -lc "cd /opt/tradingadvisor && .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 2; exec bash -lc 'while true; do .venv/bin/python scripts/ops/api_agent_bridge.py --agent glm --once >> data/logs/glm_bridge.log 2>&1; sleep 30; done'"
+start_session glm-builder bash -lc "cd /opt/tradingadvisor/.worktrees/glm-builder && /root/.nvm/versions/node/v24.19.0/bin/deepcode"
 
 if [ "${START_COORDINATOR:-0}" = "1" ]; then
   start_session claude bash -lc "cd /opt/tradingadvisor && claude --remote-control coordinator"
@@ -54,7 +59,9 @@ for ptr in $POINTERS; do
     return 1 2>/dev/null || exit 1
   fi
 done
-for agent in coordinator deepcode codex gemini; do
+# glm and glm-builder are started by this script (added 2026-09-20) and were NOT acknowledged here, so they would
+# have come up UNGOVERNED - the exact outcome this block exists to prevent. The loop must name every session started.
+for agent in coordinator deepcode codex gemini glm glm-builder; do
   if [ -x /opt/tradingadvisor/.venv/bin/python ]; then
     /opt/tradingadvisor/.venv/bin/python /opt/tradingadvisor/scripts/ops/gov_ack.py \
       ack --agent "$agent" --by bootstrap || true
