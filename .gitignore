@@ -4,3 +4,17 @@ __pycache__/
 agent-relay-mail/
 mail/
 relay.yaml
+
+# Operational, machine-local artefacts — NOT code (owner via coordinator seq2954). Added after the
+# operational dirs kept turning up as untracked and one `git add -A` would have swept them into a
+# commit: the same hazard that caught three foreign files in the tradingadvisor tree today.
+logs/
+start_agents.log
+state/
+relay.yaml.bak.*
+
+# state/deepcode_resume.uuid stays TRACKED on purpose: gitignore does not affect already-tracked
+# files, and that file is the session's resume pointer. Consequence, stated rather than hidden: a
+# FUTURE state file that must be versioned will not appear in `git status` — it needs `git add -f` or
+# an explicit negation. I chose hiding the operational noise over the risk of silently losing a
+# pointer on a fresh clone, because the pointer is the thing nobody can regenerate by hand.
