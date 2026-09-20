@@ -78,16 +78,34 @@ def load_config(config_path: str | None = None) -> dict:
     )
 
 
+def _validate_agent(agent: dict, name: str) -> dict:
+    missing = [f for f in REQUIRED_AGENT_FIELDS if f not in agent]
+    if missing:
+        raise RelayConfigError(
+            f"agente '{name}' não tem os campos obrigatórios: {missing}. "
+            "tmux_session/busy_regex/input_prefix não têm default partilhado."
+        )
+    return agent
+
+
 def get_agent(config: dict, name: str) -> dict:
+    """Resolve a name to its agent. The CANONICAL name wins; an alias resolves to the same agent.
+
+    LANE A (2026-09-20): an agent may carry `agent_id` (canonical identity), `model`, `role` and `aliases`. `name` is
+    NOT renamed by that change, because `name` is the key of the mailbox, the seq counter and the cursor
+    (to_{name}.jsonl, .seq_{name}, .cursor_{name}) - renaming it would break the mailbox history, which the criteria
+    forbid. So the alias is resolved HERE and the callers write with the RESOLVED agent's name, which keeps one mailbox
+    per agent and leaves the history alone by construction.
+
+    The exact match is tried first so that an alias can never shadow a declared name: a config mistake that lists an
+    existing name as somebody else's alias resolves to the agent that OWNS the name, which is the safe direction.
+    """
     for agent in config.get("agents", []):
         if agent.get("name") == name:
-            missing = [f for f in REQUIRED_AGENT_FIELDS if f not in agent]
-            if missing:
-                raise RelayConfigError(
-                    f"agente '{name}' não tem os campos obrigatórios: {missing}. "
-                    "tmux_session/busy_regex/input_prefix não têm default partilhado."
-                )
-            return agent
+            return _validate_agent(agent, name)
+    for agent in config.get("agents", []):
+        if name in (agent.get("aliases") or []):
+            return _validate_agent(agent, name)
     raise RelayConfigError(f"agente '{name}' não existe em relay.yaml/relay.json")
 
 
@@ -932,7 +950,7 @@ def _cmd_send(config, args, guarded: bool) -> int:
             return 1
 
     seq = append_message(
-        box_dir, args.to, args.from_, args.body,
+        box_dir, to_agent["name"], from_agent["name"], args.body,
         tokens=args.tokens, sender_repo_path=from_agent.get("repo_path"),
     )
     print(f"SENT seq={seq} to={args.to}")
@@ -969,7 +987,9 @@ def _cmd_send(config, args, guarded: bool) -> int:
 def _cmd_read(config, args, advance: bool) -> int:
     box_dir = resolve_box_dir(config)
     get_agent(config, args.who)  # validate recipient configuration
-    unread = read_messages(box_dir, args.who, advance=advance)
+    # LANE A: resolve the alias before touching the mailbox, or an alias read would look in a different box
+    # from the one the alias write used - the write-only fix would be half a fix.
+    unread = read_messages(box_dir, get_agent(config, args.who)["name"], advance=advance)
     if not unread:
         print(f"(sem mensagens novas para {args.who})")
         return 0
@@ -1019,7 +1039,7 @@ def _cmd_delivery_status(config, args) -> int:
     "did seq N leave the box" is this command's whole job."""
     box_dir = resolve_box_dir(config)
     get_agent(config, args.recipient)
-    record = delivery_record(box_dir, args.recipient, args.seq)
+    record = delivery_record(box_dir, get_agent(config, args.recipient)["name"], args.seq)
     if getattr(args, "json", False):
         print(json.dumps(record, sort_keys=True))
     else:

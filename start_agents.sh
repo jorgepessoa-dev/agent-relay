@@ -1,5 +1,7 @@
 #!/bin/bash
-# Idempotent agent-session starter — restores the 7 agent tmux sessions after
+# Idempotent agent-session starter — restores the 6 agent tmux sessions after
+# 2026-09-20: it is SIX, not seven - the glm bridge autostart was deactivated (F-1462) because the work was
+# superseded by glm-builder. The pin that counts this caught the change, which is what it is for.
 # reboot. Skips any session that already exists (never double-starts).
 #
 # Invocations mirror what the live sessions use today:
