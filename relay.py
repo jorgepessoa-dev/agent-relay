@@ -483,7 +483,12 @@ def tmux_target(session: str) -> str:
     sessions — with `lane-probe` absent and `lane-probe-builder` present, a bare
     `has-session -t lane-probe` SUCCEEDS (false positive) and a bare `kill-session -t
     lane-probe` closes `lane-probe-builder` silently, printing success (it killed the glm
-    session this morning). `=` is tmux's exact-match notation for a SESSION.
+    session this morning).
+
+    SCOPE OF THE CLAIM, corrected after review (codex seq 2847): `=NAME` is the exact
+    SELECTOR when passed to `-t`. It says nothing about other arguments: `new -s NAME` /
+    `new-session -s NAME` is CREATION, not a selector, and there is NO measurement showing
+    that `=` applies there — so no claim is made about it.
     """
     return f"={session}"
 
