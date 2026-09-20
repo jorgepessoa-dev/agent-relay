@@ -18,7 +18,9 @@ UUID_FILE=/opt/agent-relay/state/deepcode_resume.uuid
 
 start_session() {
   local name="$1"; shift
-  if tmux has-session -t "$name" 2>/dev/null; then
+  # EXACT match: with `glm` absent and `glm-builder` present, the bare form says the
+  # session EXISTS (tmux resolves by prefix) and the missing one is never started.
+  if tmux has-session -t "=$name" 2>/dev/null; then
     echo "SKIP $name (session exists)"
     return 0
   fi

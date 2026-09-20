@@ -474,10 +474,39 @@ def redeliver_unread(
     return results
 
 
+
+
+def tmux_target(session: str) -> str:
+    """EXACT session target for `has-session` / `kill-session`: `=name`.
+
+    WHY (2026-09-20, LANE C): tmux resolves a BARE name by PREFIX. Measured with two real
+    sessions — with `lane-probe` absent and `lane-probe-builder` present, a bare
+    `has-session -t lane-probe` SUCCEEDS (false positive) and a bare `kill-session -t
+    lane-probe` closes `lane-probe-builder` silently, printing success (it killed the glm
+    session this morning). `=` is tmux's exact-match notation for a SESSION.
+    """
+    return f"={session}"
+
+
+def tmux_pane_target(session: str) -> str:
+    """EXACT PANE target for `capture-pane` / `send-keys`: `=name:` — MEASURED, not assumed.
+
+    The trailing colon is not decoration: tmux parses these arguments as PANE targets
+    (`session:window.pane`), and `=name` WITHOUT the colon fails with "can't find pane"
+    even when the session exists. Measured, with a live session:
+      capture-pane -t "=probe"   -> rc!=0, can't find pane
+      capture-pane -t "=probe:"  -> rc=0, content read
+      send-keys    -t "=probe"   -> rc!=0, keystrokes NOT delivered
+      send-keys    -t "=probe:"  -> rc=0, keystrokes delivered
+    and pointing at an absent session whose PREFIX exists gives rc!=0 with NO text
+    leaking into the prefixed session — which is the property the lane required.
+    """
+    return f"={session}:"
+
 def tmux_has_session(session: str) -> bool:
     try:
         result = subprocess.run(
-            ["tmux", "has-session", "-t", session],
+            ["tmux", "has-session", "-t", tmux_target(session)],
             capture_output=True, timeout=10,
         )
         return result.returncode == 0
@@ -488,7 +517,7 @@ def tmux_has_session(session: str) -> bool:
 def tmux_capture_pane(session: str) -> tuple:
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
+            ["tmux", "capture-pane", "-t", tmux_pane_target(session), "-p"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
@@ -569,9 +598,11 @@ def nudge(to_agent: dict, seq: int, body: str, *, require_ready: bool = False) -
 
     first = body[:180].replace("\n", " ").replace('"', "'")
     msg = f"[MAIL seq={seq}] {first}... -> relay.py read --as {to_agent['name']}"
-    subprocess.run(["tmux", "send-keys", "-t", session, msg], timeout=10, check=False)
+    subprocess.run(["tmux", "send-keys", "-t", tmux_pane_target(session), msg],
+                   timeout=10, check=False)
     time.sleep(1.5)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], timeout=10, check=False)
+    subprocess.run(["tmux", "send-keys", "-t", tmux_pane_target(session), "Enter"],
+                   timeout=10, check=False)
     time.sleep(0.3)  # let the pane redraw before capturing -- see retry docstring
 
     ok, pane = tmux_capture_pane(session)
@@ -582,7 +613,8 @@ def nudge(to_agent: dict, seq: int, body: str, *, require_ready: bool = False) -
 
     for delay in (2, 3):
         time.sleep(delay)
-        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], timeout=10, check=False)
+        subprocess.run(["tmux", "send-keys", "-t", tmux_pane_target(session), "Enter"],
+                       timeout=10, check=False)
         time.sleep(0.3)
         ok, pane = tmux_capture_pane(session)
         if not ok:
