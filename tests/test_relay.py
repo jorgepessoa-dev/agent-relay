@@ -994,3 +994,199 @@ def test_normal_send_nudges_exactly_once_when_the_pane_is_ready(tmp_path, monkey
     assert '"delivered": true' in out
     assert rc == 0
 
+
+# ── relay `follow`: streaming consumer, cursor advanced PER EMITTED RECORD ───
+#
+# Pre-mortem (R-METHODOLOGY-FIRST), written before the tests ran — what would invalidate the
+# result: (1) if the cursor moved on records that were NOT emitted, the feature is not the one
+# specified → made to FIRE by test_follow_advances_ONLY_the_emitted_lines...; (2) if a restart
+# could not resume, the reboot requirement is unmet → test_follow_resumes_from_the_persisted...;
+# (3) if `follow` and a second consumer could take the same records, it would double-deliver
+# (F5) → test_follow_holds_the_consumer_lock_across_emit. A green suite that does not make these
+# fail on revert would prove nothing (A-TESTS-PROVE-WHAT-THEY-TEST).
+
+def _follow_cfg(tmp_path):
+    cfg = {
+        "box_dir": "./mail",
+        "agents": [
+            {"name": "a", "tmux_session": "sess-a", "busy_regex": "X", "input_prefix": "> "},
+            {"name": "b", "tmux_session": "sess-b", "busy_regex": "X", "input_prefix": "> "},
+        ],
+    }
+    (tmp_path / "relay.json").write_text(json.dumps(cfg))
+    return cfg
+
+
+def test_follow_emits_new_messages_and_advances_the_cursor_per_record(tmp_path):
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "um")
+    relay.append_message(box, "b", "a", "dois")
+    seen = []
+    emitted = relay.follow_messages(box, "b", emit=seen.append, once=True)
+    assert [r["body"] for r in seen] == ["um", "dois"]
+    assert emitted == 2
+    assert relay.read_cursor(box, "b") == 2
+    assert relay.read_messages(box, "b", advance=False) == []
+
+
+def test_follow_advances_ONLY_the_emitted_lines_when_emit_fails_mid_batch(tmp_path):
+    """R-FIRE: the per-record advance, made to FIRE.
+
+    Reverting to "emit the batch, then advance once" leaves the cursor at 2 here while the 2nd
+    record was never handed over — the exact loss the per-record advance prevents.
+    """
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "um")
+    relay.append_message(box, "b", "a", "dois")
+
+    class Boom(Exception):
+        pass
+
+    delivered = []
+
+    def emit(record):
+        if record["body"] == "dois":
+            raise Boom("reader died mid-batch")
+        delivered.append(record["body"])   # prove the mutation is meaningful: the 1st WAS emitted
+
+    with pytest.raises(Boom):
+        relay.follow_messages(box, "b", emit=emit, once=True)
+
+    assert delivered == ["um"]
+    assert relay.read_cursor(box, "b") == 1
+    assert [r["body"] for r in relay.read_messages(box, "b", advance=False)] == ["dois"]
+
+
+def test_follow_resumes_from_the_persisted_cursor_after_a_restart(tmp_path):
+    """No flag needed: the cursor is durable in box_dir, so a reboot resumes where it stopped."""
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "um")
+    relay.append_message(box, "b", "a", "dois")
+    first = []
+    relay.follow_messages(box, "b", emit=first.append, once=True)
+    assert [r["body"] for r in first] == ["um", "dois"]
+
+    # ... the process dies; a new one starts (just call it again) and two more arrive ...
+    relay.append_message(box, "b", "a", "tres")
+    second = []
+    relay.follow_messages(box, "b", emit=second.append, once=True)
+    assert [r["body"] for r in second] == ["tres"]      # no re-delivery of um/dois
+
+
+def test_follow_since_RAISES_the_floor_and_never_re_delivers_acknowledged_mail(tmp_path):
+    """--since is a floor, never a rewind: the effective start is max(cursor, since)."""
+    box = tmp_path / "mail"
+    for body in ("um", "dois", "tres"):
+        relay.append_message(box, "b", "a", body)
+    relay.write_cursor_atomic(box, "b", 3)              # the reader already acknowledged 1..3
+    relay.append_message(box, "b", "a", "quatro")
+    seen = []
+    relay.follow_messages(box, "b", emit=seen.append, since=1, once=True)
+    assert [r["body"] for r in seen] == ["quatro"]      # NOT um/dois/tres again
+
+
+def test_follow_since_starts_a_first_run_past_a_backlog(tmp_path):
+    box = tmp_path / "mail"
+    for body in ("um", "dois", "tres"):
+        relay.append_message(box, "b", "a", body)
+    seen = []
+    relay.follow_messages(box, "b", emit=seen.append, since=2, once=True)
+    assert [r["body"] for r in seen] == ["tres"]
+
+
+def test_follow_max_messages_stops_and_leaves_the_rest_unread(tmp_path):
+    box = tmp_path / "mail"
+    for body in ("um", "dois", "tres"):
+        relay.append_message(box, "b", "a", body)
+    seen = []
+    emitted = relay.follow_messages(box, "b", emit=seen.append, max_messages=2)
+    assert [r["body"] for r in seen] == ["um", "dois"]
+    assert emitted == 2
+    assert relay.read_cursor(box, "b") == 2
+    assert [r["body"] for r in relay.read_messages(box, "b", advance=False)] == ["tres"]
+
+
+def test_follow_idle_exit_uses_the_injected_clock_and_sleep(tmp_path):
+    """The tail loop is exercised with no real time passing (R-SEAM)."""
+    box = tmp_path / "mail"
+    ticks = {"n": 0}
+
+    def monotonic():
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] == 1 else 100.0
+
+    slept = []
+    emitted = relay.follow_messages(box, "b", emit=lambda r: None, idle_exit_s=10,
+                                    sleep=slept.append, monotonic=monotonic)
+    assert emitted == 0
+    assert slept == []                                  # exited on the clock, before sleeping
+
+
+def test_follow_holds_the_consumer_lock_across_emit(tmp_path):
+    """A second consumer must not read what `follow` is mid-emission on (F5 exclusivity)."""
+    import fcntl
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "um")
+    relay.append_message(box, "b", "a", "dois")
+    observed = {}
+
+    def emit(record):
+        with (box / ".lock_b").open("a+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed["lock_held"] = False
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                observed["lock_held"] = True
+
+    relay.follow_messages(box, "b", emit=emit, once=True)
+    assert observed["lock_held"] is True
+
+
+def test_cli_follow_emits_and_advances_through_the_real_caller(tmp_path, monkeypatch, capsys):
+    """R-SEAM: exercised through the REAL caller (relay.main), not the callee."""
+    cfg = _follow_cfg(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    relay.append_message(relay.resolve_box_dir(cfg), "b", "a", "oi")
+    rc = relay.main(["follow", "--as", "b", "--once", "--json"])
+    out = capsys.readouterr().out
+    records = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    assert rc == 0
+    assert [r["body"] for r in records] == ["oi"]
+    assert "FOLLOW emitted=1 cursor=1" in out
+    assert relay.read_cursor(relay.resolve_box_dir(cfg), "b") == 1
+
+
+def test_cli_follow_stops_at_the_first_failed_emission(tmp_path):
+    """R-FIRE through the REAL caller: a reader that dies after the 1st record must not have the
+    2nd acknowledged. A batch advance would move the cursor to 2 and this fails."""
+    box = tmp_path / "mail"
+    relay.append_message(box, "b", "a", "um")
+    relay.append_message(box, "b", "a", "dois")
+    args = relay.build_parser().parse_args(["follow", "--as", "b", "--once", "--json"])
+
+    class DyingStdout:
+        def __init__(self):
+            self.writes = 0
+
+        def write(self, text):
+            self.writes += 1
+            if self.writes >= 2:
+                raise BrokenPipeError("reader gone")
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def fileno(self):
+            raise OSError("no fileno in this test double")
+
+    cfg = {"box_dir": str(box), "agents": [
+        {"name": "b", "tmux_session": "sess-b", "busy_regex": "X", "input_prefix": "> "}]}
+    with patch.object(relay.sys, "stdout", DyingStdout()):
+        rc = relay._cmd_follow(cfg, args)
+
+    assert rc == 0
+    assert relay.read_cursor(box, "b") == 1
+    assert [r["body"] for r in relay.read_messages(box, "b", advance=False)] == ["dois"]
+

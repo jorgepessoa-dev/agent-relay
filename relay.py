@@ -38,6 +38,10 @@ APPROVAL_SCAN_TAIL_LINES = 12
 REDELIVERY_BASE_BACKOFF_S = 30 * 60
 REDELIVERY_MAX_ATTEMPTS = 6
 REDELIVERY_MAX_PER_SWEEP = 2
+# `follow` polls a mailbox for new records; this is how long it waits between
+# non-blocking checks when the mailbox is empty. Small enough to behave like a
+# tail, large enough not to spin a core.
+DEFAULT_FOLLOW_INTERVAL_S = 1.0
 
 
 class RelayConfigError(Exception):
@@ -404,6 +408,75 @@ def read_messages(box_dir: Path, name: str, advance: bool = True) -> list:
             write_cursor_atomic(box_dir, name, unread[-1]["seq"])
 
     return unread
+
+
+def follow_messages(
+    box_dir: Path,
+    name: str,
+    *,
+    emit,
+    since: int | None = None,
+    interval_s: float = DEFAULT_FOLLOW_INTERVAL_S,
+    once: bool = False,
+    max_messages: int | None = None,
+    idle_exit_s: float | None = None,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> int:
+    """Tail a mailbox, emitting every new record and advancing the cursor PER EMITTED RECORD.
+
+    WHY per emitted record, and not "emit the whole batch, then advance once": the cursor is the
+    sole acknowledgement in this transport (see `read_messages`), so it must never sit ahead of
+    what was actually handed to the reader. Advancing one record at a time makes a crash
+    mid-batch lose AT MOST the record in flight and leaves every later record still unread. A
+    test makes exactly that fire: `emit` raising on the 2nd record stops the cursor at the 1st
+    and the 2nd is still unread afterwards.
+
+    `since` RAISES the starting floor and never lowers it: the effective start is
+    `max(persisted_cursor, since)`. A restart therefore resumes from the durable cursor with no
+    flag at all, while `since` lets a first run skip a backlog. It can consequently never
+    re-deliver a record the cursor already acknowledged, which for a reader that ACTS on mail
+    would be a duplicate action. Records at or below the floor are SKIPPED on purpose: that is
+    what lets `since` jump a backlog, and it is the ONE way this consumer can lose mail, so
+    `since` must be a deliberate value, never a guess.
+
+    SEAMS (R-SEAM): `emit(record)`, `sleep` and `monotonic` are injected, so the tail loop is
+    exercised without real time passing. The safety property (advance only after a successful
+    emit) lives in code and is made to FIRE through the real CLI caller in the tests.
+
+    DECLARED LIMIT, not a claim: this advance IS the acknowledgement, so a `follow` whose output
+    nobody reads moves the cursor anyway. The watchdog's false-stranded signal is derived from
+    the cursor, so running `follow` where the records are not actually consumed would mask a
+    real stall instead of clearing a false one. Run it where the messages are read (the agent's
+    own pane, or a reader that acts on them), never as a detached drain to /dev/null.
+    """
+    start = read_cursor(box_dir, name)
+    if since is not None:
+        start = max(start, since)
+    emitted = 0
+    last_activity = monotonic()
+    while True:
+        # Hold the EXCLUSIVE consumption lock across read + emit + advance, exactly as
+        # `read_messages(advance=True)` does. Releasing it before the advance would let a second
+        # consumer read the same records and deliver them twice (F5, 2026-09-20).
+        with _consume_lock(box_dir, name):
+            unread = read_messages(box_dir, name, advance=False)
+            fresh = [r for r in unread if r["seq"] > start]
+            for record in fresh:
+                emit(record)
+                # The gate: advance ONLY after the record was handed over. A raising emit leaves
+                # this record and every later one unread.
+                write_cursor_atomic(box_dir, name, record["seq"])
+                start = record["seq"]
+                emitted += 1
+                last_activity = monotonic()
+                if max_messages is not None and emitted >= max_messages:
+                    return emitted
+        if once:
+            return emitted
+        if idle_exit_s is not None and (monotonic() - last_activity) >= idle_exit_s:
+            return emitted
+        sleep(interval_s)
 
 
 def _record_age_s(record: dict, now: datetime) -> float | None:
@@ -980,6 +1053,25 @@ def build_parser() -> argparse.ArgumentParser:
         r.add_argument("--json", action="store_true",
                        help="emit raw JSONL records instead of formatted text")
 
+    f = sub.add_parser(
+        "follow",
+        help="tail a mailbox: emit each new record and advance the cursor per emitted record")
+    f.add_argument("--as", dest="who", required=True)
+    f.add_argument("--json", action="store_true",
+                   help="emit raw JSONL records instead of formatted text")
+    f.add_argument("--since", type=int, default=None,
+                   help="start after this seq; it only RAISES the floor, so the effective start is "
+                        "max(persisted cursor, since): acknowledged mail is never re-delivered and "
+                        "records at or below that floor are SKIPPED on purpose")
+    f.add_argument("--once", action="store_true",
+                   help="emit the records that exist now and exit")
+    f.add_argument("--max-messages", type=int, default=None,
+                   help="exit after this many records")
+    f.add_argument("--idle-exit", type=float, default=None,
+                   help="exit after this many seconds with no new record")
+    f.add_argument("--interval", type=float, default=DEFAULT_FOLLOW_INTERVAL_S,
+                   help="seconds between checks when the mailbox is empty")
+
     check = sub.add_parser("check-consumer", help="THE consumer role rule")
     check.add_argument("agent")
     d = sub.add_parser("doctor")
@@ -1065,6 +1157,20 @@ def _cmd_send(config, args, guarded: bool) -> int:
     return 0
 
 
+def render_message(config: dict, record: dict) -> str:
+    """One formatted mailbox record. `read` and `follow` share this, so the two cannot drift."""
+    stale = ""
+    sender_agent = next(
+        (a for a in config.get("agents", []) if a.get("name") == record["from"]), None
+    )
+    if sender_agent and sender_agent.get("repo_path"):
+        current = head_of(sender_agent["repo_path"])
+        if record["head"] not in ("unknown", current):
+            stale = " [HEAD DO REMETENTE MUDOU DESDE O ENVIO]"
+    return (f"\n--- seq {record['seq']} | {record['ts_utc']} | "
+            f"de {record['from']}{stale} ---\n{record['body']}")
+
+
 def _cmd_read(config, args, advance: bool) -> int:
     box_dir = resolve_box_dir(config)
     get_agent(config, args.who)  # validate recipient configuration
@@ -1079,16 +1185,52 @@ def _cmd_read(config, args, advance: bool) -> int:
             print(json.dumps(rec, ensure_ascii=False))
         return 0
     for rec in unread:
-        stale = ""
-        sender_agent = next(
-            (a for a in config.get("agents", []) if a.get("name") == rec["from"]), None
+        print(render_message(config, rec))
+    return 0
+
+
+def _detach_broken_stdout() -> None:
+    """Point stdout at /dev/null so interpreter shutdown does not re-raise on a closed pipe."""
+    try:
+        target = sys.stdout.fileno()
+    except (OSError, ValueError, AttributeError):
+        return                      # a test double has no fd: nothing to detach
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, target)
+        os.close(devnull)
+    except OSError:
+        pass
+
+
+def _cmd_follow(config, args) -> int:
+    """Streaming consumer: `read` semantics applied per record as it arrives.
+
+    DECLARED LIMIT: the cursor advance IS the acknowledgement, so this must run where the emitted
+    records are actually read. See `follow_messages` for why, including what it does to the
+    watchdog's stranded signal.
+    """
+    box_dir = resolve_box_dir(config)
+    name = get_agent(config, args.who)["name"]
+
+    def emit(record: dict) -> None:
+        payload = (json.dumps(record, ensure_ascii=False) + "\n"
+                   if args.json else render_message(config, record) + "\n")
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+
+    try:
+        emitted = follow_messages(
+            box_dir, name, emit=emit, since=args.since,
+            interval_s=args.interval, once=args.once,
+            max_messages=args.max_messages, idle_exit_s=args.idle_exit,
         )
-        if sender_agent and sender_agent.get("repo_path"):
-            current = head_of(sender_agent["repo_path"])
-            if rec["head"] not in ("unknown", current):
-                stale = " [HEAD DO REMETENTE MUDOU DESDE O ENVIO]"
-        print(f"\n--- seq {rec['seq']} | {rec['ts_utc']} | de {rec['from']}{stale} ---")
-        print(rec["body"])
+    except BrokenPipeError:
+        # The reader went away (e.g. `| head`). Stop WITHOUT advancing the record whose emission
+        # failed, and without a traceback: a closed pipe is a normal way for a tail to end.
+        _detach_broken_stdout()
+        return 0
+    print(f"FOLLOW emitted={emitted} cursor={read_cursor(box_dir, name)}")
     return 0
 
 
@@ -1229,6 +1371,8 @@ def main(argv=None) -> int:
             return _cmd_read(config, args, advance=True)
         if args.cmd == "peek":
             return _cmd_read(config, args, advance=False)
+        if args.cmd == "follow":
+            return _cmd_follow(config, args)
         if args.cmd == "doctor":
             return _cmd_doctor(config, args)
         if args.cmd == "check-consumer":
